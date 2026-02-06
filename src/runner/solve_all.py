@@ -19,8 +19,10 @@ import time
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from src.agent.policy import LLMPolicy
 from src.agent.prompts import format_gauntlet_task_prompt
@@ -144,7 +146,7 @@ def main():
         elif args.provider == "anthropic":
             model = api_cfg["primary"]
         elif args.provider == "google":
-            model = api_cfg.get("google", "gemini-2.0-flash")
+            model = api_cfg.get("google", "gemini-3-flash-preview")
         else:
             model = api_cfg["fallback"]
         action_desc = get_action_description()

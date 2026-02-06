@@ -13,7 +13,7 @@ requires a mechanism to replay prior solutions.
 Usage:
     python -m src.training.collect_trajectories
     python -m src.training.collect_trajectories --steps 1 2 3
-    python -m src.training.collect_trajectories --provider google --model gemini-2.0-flash
+    python -m src.training.collect_trajectories --provider google --model gemini-3.0-flash
 """
 
 from __future__ import annotations
@@ -26,8 +26,10 @@ import time
 from pathlib import Path
 
 import yaml
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 from src.agent.mcts import MCTSSearch
 from src.agent.policy import LLMPolicy
@@ -113,7 +115,7 @@ def main():
         if provider == "anthropic":
             model = api_cfg["primary"]
         elif provider == "google":
-            model = api_cfg.get("google", "gemini-2.0-flash")
+            model = api_cfg.get("google", "gemini-3-flash-preview")
         else:
             model = api_cfg["fallback"]
 
