@@ -74,17 +74,72 @@ def _get_step_from_url(url: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _wait_for_content(page, timeout: float = 5.0, min_length: int = 1000):
-    """Poll until React renders substantial content after SPA navigation."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            if page.evaluate("document.body.innerHTML.length") >= min_length:
-                return
-        except Exception:
-            pass
+def _wait_for_content(page, timeout: float = 5.0):
+    """Wait until React renders content into #root after SPA navigation.
+
+    Uses Playwright's wait_for_selector for robust waiting that handles page
+    loads correctly. Falls back to page reload if React doesn't render.
+    """
+    try:
+        page.wait_for_selector(
+            "#root > *", state="attached", timeout=timeout * 1000
+        )
+        # Give React a moment to finish rendering after first element appears.
         time.sleep(0.3)
-    logger.warning(f"_wait_for_content timed out after {timeout}s")
+        return
+    except Exception:
+        pass
+
+    # React didn't render — reload to force fresh hydration.
+    logger.warning("React did not render, reloading page")
+    try:
+        page.reload(wait_until="networkidle", timeout=10000)
+    except Exception as e:
+        logger.warning(f"Page reload failed: {e}")
+        return
+
+    try:
+        page.wait_for_selector(
+            "#root > *", state="attached", timeout=timeout * 1000
+        )
+        time.sleep(0.3)
+    except Exception:
+        logger.warning("React still empty after reload")
+
+
+def _ensure_react_mounted(page) -> bool:
+    """Quick check that React has content; reload if not.
+
+    BrowserGym's set_of_marks injects DOM attributes on every observation,
+    which can cause React to unmount intermittently. This detects the crash
+    and recovers via page reload.
+
+    Returns True if a reload was performed (caller should re-extract obs).
+    Returns False if React content was already present (no action needed).
+    """
+    try:
+        # Fast check: does #root have any child elements?
+        if page.query_selector("#root > *"):
+            return False  # Content present, no reload needed.
+    except Exception:
+        pass
+
+    logger.warning("React content lost, reloading page")
+    try:
+        page.reload(wait_until="networkidle", timeout=10000)
+    except Exception as e:
+        logger.warning(f"Recovery reload failed: {e}")
+        return True
+
+    try:
+        page.wait_for_selector(
+            "#root > *", state="attached", timeout=5000
+        )
+        time.sleep(0.3)
+        return True  # Reloaded and content present.
+    except Exception:
+        logger.warning("React still no content after recovery reload")
+        return True
 
 
 class GauntletTask(AbstractBrowserTask):
@@ -413,24 +468,78 @@ class GauntletEnv:
         except Exception:
             pass  # Page might not be ready yet.
 
-    def _wait_and_refresh_obs(self) -> dict:
-        """Wait for React content to render, dismiss overlays, re-extract obs."""
-        _wait_for_content(self._env.page)
-        self._dismiss_overlays()
-        return self._env._get_obs()
+    def _cleanup_js_result(self):
+        """Remove the js_eval result div so it doesn't carry over between steps."""
+        try:
+            self._env.page.evaluate(
+                "document.getElementById('__bgym_js_result')?.remove()"
+            )
+        except Exception:
+            pass
+
+    def _wait_and_refresh_obs(self, max_retries: int = 2) -> dict:
+        """Reload page after step transition and extract fresh observation.
+
+        BrowserGym's set_of_marks injects DOM attributes during _get_obs(),
+        which crashes React if it's still rendering after an SPA navigation.
+        A full page reload forces React to hydrate from scratch (like initial
+        page load), so _get_obs() captures the fully-rendered AXTree before
+        React reacts to set_of_marks mutations.
+        """
+        self._cleanup_js_result()
+        page = self._env.page
+
+        for attempt in range(max_retries + 1):
+            # Full reload forces fresh React hydration.
+            try:
+                page.reload(wait_until="networkidle", timeout=10000)
+            except Exception as e:
+                logger.warning(f"Reload failed (attempt {attempt + 1}): {e}")
+
+            _wait_for_content(page)
+            self._dismiss_overlays()
+            obs = self._env._get_obs()
+
+            # Check obs quality using pruned text length, not raw AXTree
+            # child count (header elements alone satisfy children >= 3).
+            obs_text = extract_obs_text(obs, self.pruner)
+            if len(obs_text) >= 1000:
+                return obs
+
+            if attempt < max_retries:
+                logger.warning(
+                    f"Sparse obs after transition ({len(obs_text)} chars, "
+                    f"attempt {attempt + 1}), retrying"
+                )
+
+        return obs
 
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
 
-        # Wait for React to render step 1 content after START → step1 transition.
-        _wait_for_content(self._env.page)
+        # BrowserGym already captured obs during reset. Check if it's usable
+        # via obs_text length (not AXTree children — header-only passes that).
         self._dismiss_overlays()
-        obs = self._env._get_obs()
+        obs_text = extract_obs_text(obs, self.pruner)
+
+        if len(obs_text) < 1000:
+            logger.info(
+                f"Initial obs sparse ({len(obs_text)} chars), reloading"
+            )
+            try:
+                self._env.page.reload(
+                    wait_until="networkidle", timeout=10000
+                )
+            except Exception:
+                pass
+            _wait_for_content(self._env.page)
+            self._dismiss_overlays()
+            obs = self._env._get_obs()
+            obs_text = extract_obs_text(obs, self.pruner)
 
         task_info = info.get("task_info", info)
         self._prev_step = task_info.get("current_step", 1)
 
-        obs_text = extract_obs_text(obs, self.pruner)
         return obs_text, info
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
@@ -446,6 +555,15 @@ class GauntletEnv:
         self._prev_step = current_step
         self._dismiss_overlays()
         obs_text = extract_obs_text(obs, self.pruner)
+
+        # If obs is too sparse and we're not done, React likely crashed from
+        # BrowserGym's DOM mutations. Reload and re-extract.
+        if len(obs_text) < 500 and not terminated and not truncated:
+            if _ensure_react_mounted(self._env.page):
+                self._dismiss_overlays()
+                obs = self._env._get_obs()
+                obs_text = extract_obs_text(obs, self.pruner)
+
         return obs_text, reward, terminated, truncated, info
 
     def close(self):
@@ -521,32 +639,86 @@ class StepEnv:
         except Exception:
             pass
 
+    def _cleanup_js_result(self):
+        """Remove the js_eval result div so it doesn't carry over between steps."""
+        try:
+            self._env.page.evaluate(
+                "document.getElementById('__bgym_js_result')?.remove()"
+            )
+        except Exception:
+            pass
+
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
 
-        # Wait for React to render content after SPA navigation.
-        _wait_for_content(self._env.page)
         self._dismiss_overlays()
-        obs = self._env._get_obs()
-
         obs_text = extract_obs_text(obs, self.pruner)
+
+        if len(obs_text) < 1000:
+            logger.info(
+                f"Initial obs sparse ({len(obs_text)} chars), reloading"
+            )
+            try:
+                self._env.page.reload(
+                    wait_until="networkidle", timeout=10000
+                )
+            except Exception:
+                pass
+            _wait_for_content(self._env.page)
+            self._dismiss_overlays()
+            obs = self._env._get_obs()
+            obs_text = extract_obs_text(obs, self.pruner)
+
         return obs_text, info
+
+    def _wait_and_refresh_obs(self, max_retries: int = 2) -> dict:
+        """Reload page after step transition — same logic as GauntletEnv."""
+        self._cleanup_js_result()
+        page = self._env.page
+
+        for attempt in range(max_retries + 1):
+            try:
+                page.reload(wait_until="networkidle", timeout=10000)
+            except Exception as e:
+                logger.warning(f"Reload failed (attempt {attempt + 1}): {e}")
+
+            _wait_for_content(page)
+            self._dismiss_overlays()
+            obs = self._env._get_obs()
+
+            obs_text = extract_obs_text(obs, self.pruner)
+            if len(obs_text) >= 1000:
+                return obs
+
+            if attempt < max_retries:
+                logger.warning(
+                    f"Sparse obs after transition ({len(obs_text)} chars, "
+                    f"attempt {attempt + 1}), retrying"
+                )
+
+        return obs
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
         prev_url = self._env.page.url
         obs, reward, terminated, truncated, info = self._env.step(action)
 
-        # Detect URL-based step transition and wait for React to render.
+        # Detect URL-based step transition and reload for fresh React hydration.
         current_url = self._env.page.url
         prev_step = _get_step_from_url(prev_url)
         curr_step = _get_step_from_url(current_url)
         if prev_step is not None and curr_step is not None and curr_step > prev_step:
-            _wait_for_content(self._env.page)
-            self._dismiss_overlays()
-            obs = self._env._get_obs()
+            obs = self._wait_and_refresh_obs()
 
         self._dismiss_overlays()
         obs_text = extract_obs_text(obs, self.pruner)
+
+        # If obs is too sparse and we're not done, React likely crashed.
+        if len(obs_text) < 500 and not terminated and not truncated:
+            if _ensure_react_mounted(self._env.page):
+                self._dismiss_overlays()
+                obs = self._env._get_obs()
+                obs_text = extract_obs_text(obs, self.pruner)
+
         return obs_text, reward, terminated, truncated, info
 
     def close(self):
