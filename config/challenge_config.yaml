@@ -1,12 +1,24 @@
 # Challenge configuration
+#
+# The challenge is a sequential 30-step gauntlet at a single Netlify SPA.
+# Home page → click START → /step1?version=3 → /step2?version=3 → ... → /step30?version=3
+# Each step presents a unique puzzle. Solving the puzzle reveals a 6-character
+# code that must be entered in a textbox and submitted to advance.
 
 base_url: "https://serene-frangipane-7fd25b.netlify.app"
-num_challenges: 30
+num_steps: 30
+version: 3
 
-# Per-challenge settings
+# URL patterns
+home_url: "https://serene-frangipane-7fd25b.netlify.app/"
+step_url_template: "https://serene-frangipane-7fd25b.netlify.app/step{step}?version={version}"
+
+# Per-step settings
 defaults:
-  max_steps: 25
-  timeout_seconds: 30
+  max_actions_per_step: 30   # max agent actions before giving up on a step
+  max_actions_total: 500     # max total actions across all 30 steps
+  wait_after_action_ms: 500  # wait time for page to settle after action
+  timeout_seconds: 300       # 5-minute total time budget
   viewport:
     width: 1280
     height: 720
@@ -14,19 +26,20 @@ defaults:
 
 # MCTS data collection
 mcts:
-  iterations_per_challenge: 15
-  candidates_per_node: 5  # K actions sampled at each node
-  exploration_constant: 1.4  # UCB1 c parameter
-  q_blend_alpha: 0.7  # weight for MCTS Q vs critic Q
+  iterations_per_step: 15
+  candidates_per_node: 5   # K actions sampled at each node
+  exploration_constant: 1.4 # UCB1 c parameter
+  q_blend_alpha: 0.7       # weight for MCTS Q vs critic Q
   min_q_diff_for_dpo: 0.2  # minimum Q-value gap for preference pairs
 
 # Reward configuration
 reward:
-  success: 1.0
+  step_complete: 1.0        # reward for advancing to next step
+  all_complete: 10.0        # bonus for completing all 30 steps
   failure: 0.0
-  step_penalty: 0.0  # no step penalty — binary reward only
 
-# Parallel execution (submission time)
+# Parallel execution (submission time) — not applicable for sequential gauntlet
+# but kept for potential future use with independent step training
 parallel:
-  num_workers: 4
-  total_time_budget_seconds: 300  # 5 minutes
+  num_workers: 1
+  total_time_budget_seconds: 300

@@ -5,7 +5,7 @@ venv/
 # Environment variables
 .env
 .env.local
-
+data/snapshots/
 # Python
 __pycache__/
 *.pyc
