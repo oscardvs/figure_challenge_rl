@@ -31,10 +31,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 def load_trajectories(data_dir: Path) -> list[dict]:
     """Load successful trajectories from collected data."""
     trajectories = []
-    for path in sorted(data_dir.glob("challenge_*.json")):
+    for path in sorted(data_dir.glob("step_*.json")):
         with open(path) as f:
-            challenge_trajs = json.load(f)
-        for traj in challenge_trajs:
+            step_trajs = json.load(f)
+        for traj in step_trajs:
             if traj.get("success", False):
                 trajectories.append(traj)
     logger.info(f"Loaded {len(trajectories)} successful trajectories")
@@ -59,13 +59,13 @@ def format_as_conversations(
             # User turn: observation.
             if i == 0:
                 user_content = (
-                    f"Complete challenge {traj['challenge_id']}.\n\n"
-                    f"[Step {step['step_index']}] Current page state:\n"
+                    f"Complete step {traj['step_number']}.\n\n"
+                    f"[Action {step['step_index']}] Current page state:\n"
                     f"{step['obs_text']}"
                 )
             else:
                 user_content = (
-                    f"[Step {step['step_index']}] Current page state:\n"
+                    f"[Action {step['step_index']}] Current page state:\n"
                     f"{step['obs_text']}"
                 )
             messages.append({"role": "user", "content": user_content})

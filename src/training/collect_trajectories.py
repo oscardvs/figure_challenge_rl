@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 """MCTS trajectory collection script.
 
-Runs MCTS on all 30 challenges using an API model (Claude or GPT-4o),
+Runs MCTS on all 30 steps using an API model (Claude, GPT-4o, or Gemini),
 collecting trajectories, preference pairs, and step-level data for
 downstream SFT, DPO, and M-GRPO training.
 
+NOTE: The challenge is a sequential SPA. StepEnv can only directly reach
+step 1 (home → START → step1). For steps > 1, you would need to first
+solve prior steps. This collector currently works best for step 1 or
+requires a mechanism to replay prior solutions.
+
 Usage:
     python -m src.training.collect_trajectories
-    python -m src.training.collect_trajectories --challenges 1 5 10
-    python -m src.training.collect_trajectories --provider openai --model gpt-4o
+    python -m src.training.collect_trajectories --steps 1 2 3
+    python -m src.training.collect_trajectories --provider google --model gemini-2.0-flash
 """
 
 from __future__ import annotations
@@ -28,7 +33,7 @@ from src.agent.mcts import MCTSSearch
 from src.agent.policy import LLMPolicy
 from src.agent.prompts import format_task_prompt
 from src.environment.action_space import get_action_description
-from src.environment.browser_env import AdcockChallengeEnv
+from src.environment.browser_env import StepEnv
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,29 +55,28 @@ def load_configs():
     return challenge_config, model_config
 
 
-def collect_for_challenge(
-    challenge_id: int,
+def collect_for_step(
+    step_number: int,
     policy: LLMPolicy,
     challenge_config: dict,
     mcts_config: dict,
 ) -> dict:
-    """Run MCTS on a single challenge and return collected data."""
-    base_url = challenge_config["base_url"]
+    """Run MCTS on a single step and return collected data."""
     defaults = challenge_config["defaults"]
 
-    env = AdcockChallengeEnv(
-        challenge_id=challenge_id,
-        max_steps=defaults["max_steps"],
+    env = StepEnv(
+        step_number=step_number,
+        max_actions=defaults["max_actions_per_step"],
         headless=defaults["headless"],
     )
 
-    task_prompt = format_task_prompt(challenge_id, base_url)
+    task_prompt = format_task_prompt(step_number)
 
     searcher = MCTSSearch(
         env=env,
         policy=policy,
         task_prompt=task_prompt,
-        num_iterations=mcts_config["iterations_per_challenge"],
+        num_iterations=mcts_config["iterations_per_step"],
         candidates_per_node=mcts_config["candidates_per_node"],
         exploration_constant=mcts_config["exploration_constant"],
         q_blend_alpha=mcts_config["q_blend_alpha"],
@@ -89,10 +93,10 @@ def collect_for_challenge(
 def main():
     parser = argparse.ArgumentParser(description="Collect MCTS trajectories")
     parser.add_argument(
-        "--challenges", nargs="+", type=int,
-        help="Specific challenge IDs (default: all 1-30)",
+        "--steps", nargs="+", type=int,
+        help="Specific step numbers to collect (default: all 1-30)",
     )
-    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai"])
+    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai", "google"])
     parser.add_argument("--model", default=None, help="Override model name")
     parser.add_argument("--output-dir", default=None, help="Override output directory")
     args = parser.parse_args()
@@ -106,7 +110,12 @@ def main():
         model = args.model
     else:
         api_cfg = model_config["api_models"]
-        model = api_cfg["primary"] if provider == "anthropic" else api_cfg["fallback"]
+        if provider == "anthropic":
+            model = api_cfg["primary"]
+        elif provider == "google":
+            model = api_cfg.get("google", "gemini-2.0-flash")
+        else:
+            model = api_cfg["fallback"]
 
     action_desc = get_action_description()
 
@@ -118,7 +127,7 @@ def main():
         action_description=action_desc,
     )
 
-    challenges = args.challenges or list(range(1, challenge_config["num_challenges"] + 1))
+    steps = args.steps or list(range(1, challenge_config["num_steps"] + 1))
     output_dir = Path(args.output_dir) if args.output_dir else DATA_DIR
     traj_dir = output_dir / "trajectories"
     pref_dir = output_dir / "preference_pairs"
@@ -136,16 +145,16 @@ def main():
 
     start_time = time.time()
 
-    for cid in challenges:
-        logger.info(f"{'='*40} Challenge {cid} {'='*40}")
+    for step_num in steps:
+        logger.info(f"{'='*40} Step {step_num} {'='*40}")
         try:
-            results = collect_for_challenge(cid, policy, challenge_config, mcts_config)
+            results = collect_for_step(step_num, policy, challenge_config, mcts_config)
 
-            # Save per-challenge data.
-            with open(traj_dir / f"challenge_{cid:02d}.json", "w") as f:
+            # Save per-step data.
+            with open(traj_dir / f"step_{step_num:02d}.json", "w") as f:
                 json.dump(results["trajectories"], f, indent=2)
 
-            with open(pref_dir / f"challenge_{cid:02d}.json", "w") as f:
+            with open(pref_dir / f"step_{step_num:02d}.json", "w") as f:
                 json.dump(results["preference_pairs"], f, indent=2)
 
             all_trajectories.extend(results["trajectories"])
@@ -158,14 +167,14 @@ def main():
             all_stats["total_preference_pairs"] += stats["total_preference_pairs"]
 
             logger.info(
-                f"Challenge {cid}: {stats['successful_trajectories']}/"
+                f"Step {step_num}: {stats['successful_trajectories']}/"
                 f"{stats['total_trajectories']} successful, "
-                f"{stats['total_steps']} steps, "
+                f"{stats['total_steps']} actions, "
                 f"{stats['total_preference_pairs']} pref pairs"
             )
 
         except Exception as e:
-            logger.error(f"Challenge {cid} failed: {e}", exc_info=True)
+            logger.error(f"Step {step_num} failed: {e}", exc_info=True)
 
     elapsed = time.time() - start_time
 
@@ -180,7 +189,7 @@ def main():
     logger.info(f"Collection complete in {elapsed:.0f}s")
     logger.info(f"Trajectories: {all_stats['total_trajectories']} "
                 f"({all_stats['successful_trajectories']} successful)")
-    logger.info(f"Steps: {all_stats['total_steps']}")
+    logger.info(f"Actions: {all_stats['total_steps']}")
     logger.info(f"Preference pairs: {all_stats['total_preference_pairs']}")
     logger.info(f"API tokens: {policy.total_tokens}")
     logger.info(f"Data saved to {output_dir}")

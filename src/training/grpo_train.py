@@ -219,10 +219,9 @@ def train(
 
     from src.agent.prompts import format_system_prompt, format_task_prompt
     from src.environment.action_space import get_action_description
-    from src.environment.browser_env import AdcockChallengeEnv
+    from src.environment.browser_env import StepEnv
 
     grpo_cfg = model_config["grpo"]
-    challenge_base_url = "https://serene-frangipane-7fd25b.netlify.app"
 
     system_prompt = format_system_prompt(get_action_description())
 
@@ -247,13 +246,13 @@ def train(
     logger.info(f"Starting M-GRPO training: {num_episodes} episodes, group_size={group_size}")
 
     while episodes_done < num_episodes:
-        # Sample a random challenge.
-        challenge_id = challenges[episodes_done % len(challenges)]
-        task_prompt = format_task_prompt(challenge_id, challenge_base_url)
+        # Sample a random step.
+        step_number = challenges[episodes_done % len(challenges)]
+        task_prompt = format_task_prompt(step_number)
 
-        env = AdcockChallengeEnv(
-            challenge_id=challenge_id,
-            max_steps=25,
+        env = StepEnv(
+            step_number=step_number,
+            max_actions=25,
             headless=True,
         )
 

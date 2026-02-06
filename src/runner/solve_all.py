@@ -63,7 +63,8 @@ def solve_gauntlet_api(
 
     try:
         obs_text, info = env.reset()
-        current_step = info.get("current_step", 1)
+        task_info = info.get("task_info", info)
+        current_step = task_info.get("current_step", 1)
         action_history: list[str] = []
         step_start_time = time.time()
         step_actions = 0
@@ -82,7 +83,8 @@ def solve_gauntlet_api(
             action_history.append(action)
             step_actions += 1
 
-            new_step = info.get("current_step", current_step)
+            task_info = info.get("task_info", info)
+            new_step = task_info.get("current_step", current_step)
 
             # Detect step advancement.
             if new_step > current_step:
@@ -127,7 +129,7 @@ def solve_gauntlet_api(
 def main():
     parser = argparse.ArgumentParser(description="Solve the 30-step gauntlet")
     parser.add_argument("--mode", default="api", choices=["api", "local"])
-    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai"])
+    parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai", "google"])
     parser.add_argument("--model", default=None)
     parser.add_argument("--output", default=None, help="Metrics output path")
     args = parser.parse_args()
@@ -137,9 +139,14 @@ def main():
 
     if args.mode == "api":
         api_cfg = model_config["api_models"]
-        model = args.model or (
-            api_cfg["primary"] if args.provider == "anthropic" else api_cfg["fallback"]
-        )
+        if args.model:
+            model = args.model
+        elif args.provider == "anthropic":
+            model = api_cfg["primary"]
+        elif args.provider == "google":
+            model = api_cfg.get("google", "gemini-2.0-flash")
+        else:
+            model = api_cfg["fallback"]
         action_desc = get_action_description()
         policy = LLMPolicy(
             provider=args.provider,

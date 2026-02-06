@@ -1,19 +1,15 @@
 """LLM policy wrappers for action proposal and critique.
 
-Supports Claude (Anthropic) and GPT-4o (OpenAI) as backend models
-for MCTS data collection.
+Supports Claude (Anthropic), GPT-4o (OpenAI), and Gemini (Google)
+as backend models for MCTS data collection.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import re
 from dataclasses import dataclass
 from typing import Optional
-
-import anthropic
-import openai
 
 from src.agent.prompts import (
     format_observation_message,
@@ -39,6 +35,8 @@ class LLMPolicy:
     Used during MCTS data collection (Phase 2) where the API model
     serves as both the policy (proposing actions) and the critic
     (ranking actions by estimated utility).
+
+    Supported providers: "anthropic", "openai", "google".
     """
 
     def __init__(
@@ -56,9 +54,14 @@ class LLMPolicy:
         self.action_description = action_description
 
         if provider == "anthropic":
+            import anthropic
             self.client = anthropic.Anthropic()
         elif provider == "openai":
+            import openai
             self.client = openai.OpenAI()
+        elif provider == "google":
+            from google import genai
+            self.client = genai.Client()
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
@@ -182,6 +185,8 @@ class LLMPolicy:
         """Make an API call and return the response text."""
         if self.provider == "anthropic":
             return self._call_anthropic(user_message)
+        elif self.provider == "google":
+            return self._call_google(user_message)
         else:
             return self._call_openai(user_message)
 
@@ -211,6 +216,26 @@ class LLMPolicy:
         self._total_input_tokens += usage.prompt_tokens
         self._total_output_tokens += usage.completion_tokens
         return response.choices[0].message.content
+
+    def _call_google(self, user_message: str) -> str:
+        """Call the Gemini API via the google-genai SDK."""
+        from google.genai import types
+
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=user_message,
+            config=types.GenerateContentConfig(
+                system_instruction=self.system_prompt,
+                temperature=self.temperature,
+                max_output_tokens=self.max_tokens,
+            ),
+        )
+        # Track token usage from Gemini's usage metadata.
+        if response.usage_metadata:
+            self._total_input_tokens += response.usage_metadata.prompt_token_count or 0
+            self._total_output_tokens += response.usage_metadata.candidates_token_count or 0
+
+        return response.text
 
     def _parse_candidates(self, response: str, k: int) -> list[ActionCandidate]:
         """Parse K candidates from the LLM response."""

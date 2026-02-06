@@ -132,18 +132,36 @@ class GauntletTask(AbstractBrowserTask):
                 f"(action {self.action_count}, {elapsed:.1f}s)"
             )
 
+        # Detect step 30 completion — URL may go to /complete, /success,
+        # or page content may indicate gauntlet finished.
+        if self.current_step == self.num_steps and detected_step is None:
+            try:
+                body_text = page.inner_text("body", timeout=2000).lower()
+                if any(w in body_text for w in ("congratulat", "complete", "finished", "you win", "all 30")):
+                    self.steps_completed = self.num_steps
+                    reward += 1.0
+                    logger.info("Detected gauntlet completion via page content")
+            except Exception:
+                pass
+
         # Check if all steps are complete.
         if self.steps_completed >= self.num_steps:
             done = True
             reward += 10.0  # Bonus for completing all 30.
 
-        # Check for timeout / action budget.
+        # Check for timeout / action budget per step.
+        step_stuck = False
         if self.actions_this_step >= self.max_actions_per_step:
             logger.warning(
                 f"Exceeded {self.max_actions_per_step} actions on step "
-                f"{self.current_step}, giving up on this step"
+                f"{self.current_step}, skipping this step"
             )
-            # Don't terminate — let the gauntlet continue but the step is stuck.
+            step_stuck = True
+            self.current_step += 1
+            self.actions_this_step = 0
+            # If skipping past the last step, terminate.
+            if self.current_step > self.num_steps:
+                done = True
 
         info = {
             "current_step": self.current_step,
@@ -152,6 +170,7 @@ class GauntletTask(AbstractBrowserTask):
             "actions_this_step": self.actions_this_step,
             "elapsed_seconds": elapsed,
             "url": url,
+            "step_skipped": step_stuck,
         }
 
         return reward, done, "", info

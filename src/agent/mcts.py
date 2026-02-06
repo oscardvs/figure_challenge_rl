@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.agent.policy import ActionCandidate, LLMPolicy
-from src.environment.browser_env import AdcockChallengeEnv
+from src.environment.browser_env import StepEnv
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +68,8 @@ class TrajectoryStep:
 
 @dataclass
 class Trajectory:
-    """A complete trajectory through a challenge."""
-    challenge_id: int
+    """A complete trajectory through a challenge step."""
+    step_number: int
     steps: list[TrajectoryStep]
     total_reward: float
     success: bool
@@ -84,7 +84,7 @@ class PreferencePair:
     rejected_action: str
     chosen_q: float
     rejected_q: float
-    challenge_id: int
+    step_number: int
     step_index: int
 
 
@@ -94,7 +94,7 @@ def _hash_state(obs_text: str) -> str:
 
 
 class MCTSSearch:
-    """MCTS search over browser states for a single challenge.
+    """MCTS search over browser states for a single challenge step.
 
     Algorithm per the plan:
     1. Selection: UCB1 with Q-value blending (MCTS + critic).
@@ -105,7 +105,7 @@ class MCTSSearch:
 
     def __init__(
         self,
-        env: AdcockChallengeEnv,
+        env: StepEnv,
         policy: LLMPolicy,
         task_prompt: str,
         num_iterations: int = 15,
@@ -182,7 +182,7 @@ class MCTSSearch:
         total_reward = 0.0
         start_time = time.time()
 
-        for step_idx in range(self.env.max_steps):
+        for step_idx in range(self.env.max_actions):
             # Phase 1: Selection — walk existing tree with UCB1.
             while not current_node.is_leaf and not current_node.is_fully_expanded:
                 action_str = self._ucb1_select(current_node)
@@ -285,7 +285,7 @@ class MCTSSearch:
 
         success = total_reward > 0
         return Trajectory(
-            challenge_id=self.env.challenge_id,
+            step_number=self.env.step_number,
             steps=steps,
             total_reward=total_reward,
             success=success,
@@ -355,7 +355,7 @@ class MCTSSearch:
                             rejected_action=a_lose,
                             chosen_q=c_win.q_value,
                             rejected_q=c_lose.q_value,
-                            challenge_id=self.env.challenge_id,
+                            step_number=self.env.step_number,
                             step_index=node.depth,
                         ))
 
@@ -368,7 +368,7 @@ class MCTSSearch:
         return {
             "trajectories": [
                 {
-                    "challenge_id": t.challenge_id,
+                    "step_number": t.step_number,
                     "success": t.success,
                     "total_reward": t.total_reward,
                     "num_steps": len(t.steps),
@@ -395,7 +395,7 @@ class MCTSSearch:
                     "rejected_action": p.rejected_action,
                     "chosen_q": p.chosen_q,
                     "rejected_q": p.rejected_q,
-                    "challenge_id": p.challenge_id,
+                    "step_number": p.step_number,
                     "step_index": p.step_index,
                 }
                 for p in self.preference_pairs
