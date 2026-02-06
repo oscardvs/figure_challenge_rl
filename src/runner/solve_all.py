@@ -81,12 +81,19 @@ def solve_gauntlet_api(
                 step=action_idx,
             )
 
+            logger.info(f"[Step {current_step} | Action {step_actions + 1}] {action}")
+
             obs_text, reward, terminated, truncated, info = env.step(action)
             action_history.append(action)
             step_actions += 1
 
             task_info = info.get("task_info", info)
             new_step = task_info.get("current_step", current_step)
+
+            # Log errors from the browser.
+            last_error = obs_text.split("Action error: ")[-1].split("\n")[0] if "Action error:" in obs_text else ""
+            if last_error:
+                logger.warning(f"  -> Error: {last_error}")
 
             # Detect step advancement.
             if new_step > current_step:
@@ -154,6 +161,8 @@ def main():
             provider=args.provider,
             model=model,
             action_description=action_desc,
+            max_tokens=api_cfg.get("max_tokens", 2048),
+            temperature=api_cfg.get("temperature", 0.7),
         )
 
         run_metrics = solve_gauntlet_api(policy, challenge_config)

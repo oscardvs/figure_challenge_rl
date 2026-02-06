@@ -5,10 +5,9 @@ Runs MCTS on all 30 steps using an API model (Claude, GPT-4o, or Gemini),
 collecting trajectories, preference pairs, and step-level data for
 downstream SFT, DPO, and M-GRPO training.
 
-NOTE: The challenge is a sequential SPA. StepEnv can only directly reach
-step 1 (home → START → step1). For steps > 1, you would need to first
-solve prior steps. This collector currently works best for step 1 or
-requires a mechanism to replay prior solutions.
+The challenge is a sequential SPA. For steps > 1, prior solutions must be
+replayed to navigate through earlier steps. Known solutions are loaded from
+data/known_solutions.json and accumulated as new steps are solved.
 
 Usage:
     python -m src.training.collect_trajectories
@@ -47,6 +46,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_PATH = PROJECT_ROOT / "config" / "challenge_config.yaml"
 MODEL_CONFIG_PATH = PROJECT_ROOT / "config" / "model_config.yaml"
 DATA_DIR = PROJECT_ROOT / "data"
+SOLUTIONS_PATH = DATA_DIR / "known_solutions.json"
 
 
 def load_configs():
@@ -57,11 +57,52 @@ def load_configs():
     return challenge_config, model_config
 
 
+def load_known_solutions() -> dict[int, str]:
+    """Load previously discovered solution codes from disk."""
+    if SOLUTIONS_PATH.exists():
+        with open(SOLUTIONS_PATH) as f:
+            raw = json.load(f)
+        # JSON keys are strings; convert to int.
+        return {int(k): v for k, v in raw.items()}
+    return {}
+
+
+def save_known_solutions(solutions: dict[int, str]):
+    """Persist solution codes to disk for future runs."""
+    SOLUTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Sort by step number for readability.
+    ordered = {str(k): v for k, v in sorted(solutions.items())}
+    with open(SOLUTIONS_PATH, "w") as f:
+        json.dump(ordered, f, indent=2)
+
+
+def _extract_code_from_trajectories(trajectories: list[dict]) -> str | None:
+    """Try to find the solution code from successful trajectories.
+
+    Looks for a 6-character alphanumeric code that was entered in a fill()
+    action right before a successful Submit Code click.
+    """
+    import re
+
+    fill_pattern = re.compile(r'fill\([^,]+,\s*"([A-Za-z0-9]{6})"\)')
+
+    for traj in trajectories:
+        if not traj.get("success"):
+            continue
+        actions = traj.get("actions", [])
+        for action_str in reversed(actions):
+            m = fill_pattern.search(action_str)
+            if m:
+                return m.group(1)
+    return None
+
+
 def collect_for_step(
     step_number: int,
     policy: LLMPolicy,
     challenge_config: dict,
     mcts_config: dict,
+    prior_solutions: dict[int, str] | None = None,
 ) -> dict:
     """Run MCTS on a single step and return collected data."""
     defaults = challenge_config["defaults"]
@@ -70,6 +111,7 @@ def collect_for_step(
         step_number=step_number,
         max_actions=defaults["max_actions_per_step"],
         headless=defaults["headless"],
+        prior_solutions=prior_solutions,
     )
 
     task_prompt = format_task_prompt(step_number)
@@ -136,6 +178,10 @@ def main():
     traj_dir.mkdir(parents=True, exist_ok=True)
     pref_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load known solutions for replaying prior steps.
+    solutions = load_known_solutions()
+    logger.info(f"Loaded {len(solutions)} known solutions: {sorted(solutions.keys())}")
+
     all_trajectories = []
     all_preferences = []
     all_stats = {
@@ -149,8 +195,21 @@ def main():
 
     for step_num in steps:
         logger.info(f"{'='*40} Step {step_num} {'='*40}")
+
+        # Check if we have all prior solutions needed for this step.
+        missing = [s for s in range(1, step_num) if s not in solutions]
+        if missing:
+            logger.warning(
+                f"Missing solutions for steps {missing}, "
+                f"cannot reach step {step_num} — skipping"
+            )
+            continue
+
         try:
-            results = collect_for_step(step_num, policy, challenge_config, mcts_config)
+            results = collect_for_step(
+                step_num, policy, challenge_config, mcts_config,
+                prior_solutions=solutions if step_num > 1 else None,
+            )
 
             # Save per-step data.
             with open(traj_dir / f"step_{step_num:02d}.json", "w") as f:
@@ -175,6 +234,14 @@ def main():
                 f"{stats['total_preference_pairs']} pref pairs"
             )
 
+            # Extract and accumulate solution code from successful trajectories.
+            if step_num not in solutions:
+                code = _extract_code_from_trajectories(results["trajectories"])
+                if code:
+                    solutions[step_num] = code
+                    save_known_solutions(solutions)
+                    logger.info(f"Discovered solution for step {step_num}: {code}")
+
         except Exception as e:
             logger.error(f"Step {step_num} failed: {e}", exc_info=True)
 
@@ -194,6 +261,7 @@ def main():
     logger.info(f"Actions: {all_stats['total_steps']}")
     logger.info(f"Preference pairs: {all_stats['total_preference_pairs']}")
     logger.info(f"API tokens: {policy.total_tokens}")
+    logger.info(f"Known solutions: {len(solutions)} steps")
     logger.info(f"Data saved to {output_dir}")
 
 

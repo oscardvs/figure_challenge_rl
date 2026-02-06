@@ -31,11 +31,12 @@ policy = LLMPolicy(
     provider="google",
     model="gemini-3-flash-preview",
     action_description=action_desc,
+    max_tokens=2048,
 )
 
 action_history = []
 
-for i in range(3):
+for i in range(15):
     print(f"\n{'=' * 80}")
     print(f"ACTION {i + 1}")
     print("=" * 80)
@@ -47,15 +48,23 @@ for i in range(3):
         step=i,
     )
 
-    print(f"\nLLM RESPONSE (full):\n{reasoning[:1500]}")
     print(f"\nPARSED ACTION: {repr(action)}")
 
     try:
         obs_text, reward, terminated, truncated, info = env.step(action)
         action_history.append(action)
-        print(f"\nRESULT: reward={reward}, terminated={terminated}, truncated={truncated}")
-        print(f"INFO: {info}")
-        print(f"\nNEW OBSERVATION (first 1500 chars):\n{obs_text[:1500]}")
+        task_info = info.get("task_info", info)
+        print(f"RESULT: reward={reward}, step={task_info.get('current_step')}")
+        # Show key parts of observation.
+        print(f"OBS: {len(obs_text)} chars")
+        # If observation is very short, print it all (likely a page transition issue).
+        if len(obs_text) < 500:
+            print(f"  FULL OBS:\n{obs_text}")
+        else:
+            for line in obs_text.split("\n"):
+                ll = line.strip().lower()
+                if any(k in ll for k in ("textbox", "submit", "code", "challenge", "scroll to", "hidden", "step ", "error", "intercept", "timer", "wait", "reveal")):
+                    print(f"  >> {line.strip()}")
     except Exception as e:
         print(f"\nACTION FAILED: {e}")
         break

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 SYSTEM_PROMPT = """\
 You are an autonomous browser agent solving a 30-step web navigation gauntlet. \
 You interact with web pages by reading the accessibility tree and issuing actions.
@@ -33,6 +35,20 @@ with a [bid] tag are interactive — use these bid values in your actions.
 3. If a previous action failed, read the error and try a different approach.
 4. Focus on finding the 6-character code and entering it. Ignore distractions.
 5. The code is always exactly 6 alphanumeric characters (e.g., "KNYM9C").
+6. If a click fails because another element "intercepts pointer events", scroll \
+the page (e.g., scroll(0, 300)) to move the target out from under fixed headers, \
+then retry the click.
+7. Use press(bid, key_combo) for keyboard-based puzzles (e.g., press("0", "ArrowDown")).
+8. Use js_eval(code) when the puzzle involves content not in the accessibility tree:
+   - Shadow DOM elements (code hidden inside shadow roots)
+   - Canvas content (readback pixel data or overlay text)
+   - Audio/video state (playback info, hidden metadata)
+   - WebSocket or service worker messages
+   - Iframe content from different origins
+   - DOM mutation observation (waiting for dynamically injected codes)
+   - Any hidden JavaScript variables (window.__secret, data attributes, etc.)
+   The result of js_eval() appears as a "JavaScript result" status element in \
+the next observation. Read the result there to find the code.
 
 ## Output Format
 <think>
@@ -77,25 +93,34 @@ def format_observation_message(observation_text: str, step: int) -> str:
     return f"[Action {step}] Current page state:\n{observation_text}"
 
 
+_ACTION_PATTERN = re.compile(
+    r"^(click|dblclick|fill|select_option|hover|press|focus|clear|"
+    r"scroll|drag_and_drop|upload_file|"
+    r"goto|go_back|go_forward|new_tab|tab_close|tab_focus|"
+    r"js_eval|send_msg_to_user|noop)\s*\(",
+)
+
+
 def parse_action_from_response(response: str) -> str:
     """Extract the action from an LLM response.
 
-    Expects the action to appear after a </think> block (if present),
-    or as the last non-empty line.
+    Expects format: <think>reasoning</think>\\naction(args)
+    Handles truncated think blocks and responses without think tags.
     """
-    # Try to find content after </think>
+    # 1. If there's a complete </think>, take what's after it.
     if "</think>" in response:
         after_think = response.split("</think>")[-1].strip()
-        if after_think:
-            for line in after_think.split("\n"):
-                line = line.strip()
-                if line:
-                    return line
+        for line in after_think.split("\n"):
+            line = line.strip()
+            if line and _ACTION_PATTERN.match(line):
+                return line
+        # After </think> but no valid action — fall through to scan.
 
-    # Fallback: return the last non-empty line
-    for line in reversed(response.strip().split("\n")):
+    # 2. Scan all lines for something that looks like a BrowserGym action.
+    for line in response.strip().split("\n"):
         line = line.strip()
-        if line and not line.startswith("<"):
+        if _ACTION_PATTERN.match(line):
             return line
 
-    return response.strip()
+    # 3. No valid action found — return noop to avoid sending garbage.
+    return 'noop()'

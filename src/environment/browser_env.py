@@ -28,6 +28,38 @@ from src.environment.observation import AXTreePruner, extract_obs_text
 
 logger = logging.getLogger(__name__)
 
+# JavaScript to dismiss popup overlays that block interaction.
+# The challenge pages spawn multiple fixed-position overlays (z-index 9996-10000)
+# including cookie consent, "you won a prize", fake alerts, and fullscreen backdrops.
+# These are intentional distractions, not puzzle content.
+_DISMISS_OVERLAYS_JS = """\
+(() => {
+  // Remove fullscreen backdrop overlays (fixed inset-0, high z-index).
+  document.querySelectorAll('.fixed.inset-0').forEach(el => el.remove());
+  // Remove popup modals (fixed position, z-index >= 9990).
+  document.querySelectorAll('[class*="fixed"]').forEach(el => {
+    const z = parseInt(getComputedStyle(el).zIndex) || 0;
+    const text = (el.textContent || '').toLowerCase();
+    // Keep the step progress header — make it click-through instead.
+    if (text.includes('of 30') && text.includes('browser navigation')) {
+      el.style.pointerEvents = 'none';
+      return;
+    }
+    // Remove popup overlays (cookie consent, prizes, alerts, etc.)
+    if (z >= 9990) {
+      el.remove();
+    }
+  });
+  // Remove floating clickable distractors (absolute/fixed positioned "Click Me" etc.)
+  document.querySelectorAll('[class*="fixed"][class*="cursor-pointer"]').forEach(el => {
+    const text = (el.textContent || '').trim();
+    if (['Click Me!', 'Link!', 'Here!', 'Try This!', 'Button!', 'Moving!'].includes(text)) {
+      el.remove();
+    }
+  });
+})();
+"""
+
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "challenge_config.yaml"
 
 
@@ -40,6 +72,19 @@ def _get_step_from_url(url: str) -> int | None:
     """Extract the step number from a URL like /step5?version=3."""
     match = re.search(r"/step(\d+)", url)
     return int(match.group(1)) if match else None
+
+
+def _wait_for_content(page, timeout: float = 5.0, min_length: int = 1000):
+    """Poll until React renders substantial content after SPA navigation."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if page.evaluate("document.body.innerHTML.length") >= min_length:
+                return
+        except Exception:
+            pass
+        time.sleep(0.3)
+    logger.warning(f"_wait_for_content timed out after {timeout}s")
 
 
 class GauntletTask(AbstractBrowserTask):
@@ -187,9 +232,8 @@ class StepTask(AbstractBrowserTask):
     other steps, you must navigate through the app sequentially (home →
     START → solve step 1 → step 2 → ... → step N).
 
-    For step 1, this task navigates directly. For step N > 1, it starts
-    from the home page and auto-completes prior steps (not yet implemented;
-    use GauntletEnv instead).
+    When prior_solutions is provided, setup() auto-replays prior steps
+    by entering known codes and clicking Submit to reach the target step.
     """
 
     def __init__(
@@ -199,12 +243,14 @@ class StepTask(AbstractBrowserTask):
         base_url: str,
         version: int = 3,
         max_actions: int = 30,
+        prior_solutions: dict[int, str] | None = None,
     ):
         super().__init__(seed)
         self.step_number = step_number
         self.base_url = base_url.rstrip("/")
         self.version = version
         self.max_actions = max_actions
+        self.prior_solutions = prior_solutions or {}
         self.start_time: float = 0
         self.action_count: int = 0
 
@@ -216,12 +262,43 @@ class StepTask(AbstractBrowserTask):
     def get_task_id(cls) -> str:
         return "adcock_step"
 
+    def _replay_prior_steps(self, page):
+        """Auto-replay prior steps using known solution codes."""
+        for step_idx in range(1, self.step_number):
+            code = self.prior_solutions.get(step_idx)
+            if not code:
+                logger.warning(
+                    f"No solution for step {step_idx}, cannot reach step {self.step_number}"
+                )
+                return False
+
+            # Wait for content to render after SPA transition.
+            _wait_for_content(page)
+
+            try:
+                # Find the code input and fill it.
+                code_input = page.get_by_placeholder("Enter 6-character code")
+                code_input.fill(code, timeout=5000)
+
+                # Click Submit Code.
+                submit_btn = page.get_by_role("button", name="Submit Code")
+                submit_btn.click(timeout=5000)
+
+                # Wait for navigation to next step.
+                next_step = step_idx + 1
+                page.wait_for_url(f"**/step{next_step}**", timeout=10000)
+                logger.info(f"Replayed step {step_idx} → step {next_step}")
+            except Exception as e:
+                logger.warning(f"Failed to replay step {step_idx}: {e}")
+                return False
+
+        return True
+
     def setup(self, page) -> tuple[list[dict], dict]:
         """Navigate to the step via the app's client-side routing.
 
         For step 1: go to home page and click START.
-        For step N > 1: currently only step 1 is directly reachable.
-        Use GauntletEnv for multi-step access.
+        For step N > 1: auto-replay prior steps if solutions are available.
         """
         # Always start from home and click START (SPA client-side routing).
         page.goto(self.base_url, wait_until="networkidle", timeout=15000)
@@ -231,6 +308,10 @@ class StepTask(AbstractBrowserTask):
             page.wait_for_url("**/step1**", timeout=10000)
         except Exception as e:
             logger.warning(f"Failed to click START: {e}")
+
+        # Auto-replay prior steps if needed.
+        if self.step_number > 1:
+            self._replay_prior_steps(page)
 
         self.start_time = time.time()
         self.action_count = 0
@@ -299,9 +380,10 @@ class GauntletEnv:
         self.version = config.get("version", 3)
         self.num_steps = config.get("num_steps", 30)
         self.max_actions_per_step = max_actions_per_step
+        self._prev_step: int | None = None
 
         self.pruner = AXTreePruner(
-            visible_only=True,
+            visible_only=False,
             with_bid_only=True,
             target_tokens=target_tokens,
         )
@@ -324,13 +406,45 @@ class GauntletEnv:
             record_video_dir=record_video_dir,
         )
 
+    def _dismiss_overlays(self):
+        """Remove popup overlays that block page interaction."""
+        try:
+            self._env.page.evaluate(_DISMISS_OVERLAYS_JS)
+        except Exception:
+            pass  # Page might not be ready yet.
+
+    def _wait_and_refresh_obs(self) -> dict:
+        """Wait for React content to render, dismiss overlays, re-extract obs."""
+        _wait_for_content(self._env.page)
+        self._dismiss_overlays()
+        return self._env._get_obs()
+
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
+
+        # Wait for React to render step 1 content after START → step1 transition.
+        _wait_for_content(self._env.page)
+        self._dismiss_overlays()
+        obs = self._env._get_obs()
+
+        task_info = info.get("task_info", info)
+        self._prev_step = task_info.get("current_step", 1)
+
         obs_text = extract_obs_text(obs, self.pruner)
         return obs_text, info
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
         obs, reward, terminated, truncated, info = self._env.step(action)
+
+        task_info = info.get("task_info", info)
+        current_step = task_info.get("current_step", self._prev_step)
+
+        # Detect step transition — React SPA needs time to render new step content.
+        if self._prev_step is not None and current_step > self._prev_step:
+            obs = self._wait_and_refresh_obs()
+
+        self._prev_step = current_step
+        self._dismiss_overlays()
         obs_text = extract_obs_text(obs, self.pruner)
         return obs_text, reward, terminated, truncated, info
 
@@ -347,13 +461,11 @@ class GauntletEnv:
 class StepEnv:
     """Single-step environment for MCTS training data collection.
 
-    Navigates directly to step N. Success = URL advances to step N+1.
-    Note: Direct navigation to /stepN may not work if the site requires
-    completing prior steps. In that case, use GauntletEnv to reach step N
-    first, then collect data from that point.
+    Navigates to step N (auto-replaying prior steps if solutions are provided).
+    Success = URL advances to step N+1.
 
     Usage:
-        env = StepEnv(step_number=5)
+        env = StepEnv(step_number=5, prior_solutions={1: "ABC123", 2: "DEF456", ...})
         obs_text, info = env.reset()
         while True:
             obs_text, reward, terminated, truncated, info = env.step(action)
@@ -369,6 +481,7 @@ class StepEnv:
         record_video_dir: Optional[str] = None,
         target_tokens: int = 3000,
         max_actions: int = 30,
+        prior_solutions: dict[int, str] | None = None,
     ):
         config = _load_config()
         self.step_number = step_number
@@ -377,7 +490,7 @@ class StepEnv:
         self.max_actions = max_actions
 
         self.pruner = AXTreePruner(
-            visible_only=True,
+            visible_only=False,
             with_bid_only=True,
             target_tokens=target_tokens,
         )
@@ -394,19 +507,45 @@ class StepEnv:
                 "base_url": self.base_url,
                 "version": self.version,
                 "max_actions": max_actions,
+                "prior_solutions": prior_solutions,
             },
             headless=headless,
             action_mapping=action_set.to_python_code,
             record_video_dir=record_video_dir,
         )
 
+    def _dismiss_overlays(self):
+        """Remove popup overlays that block page interaction."""
+        try:
+            self._env.page.evaluate(_DISMISS_OVERLAYS_JS)
+        except Exception:
+            pass
+
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
+
+        # Wait for React to render content after SPA navigation.
+        _wait_for_content(self._env.page)
+        self._dismiss_overlays()
+        obs = self._env._get_obs()
+
         obs_text = extract_obs_text(obs, self.pruner)
         return obs_text, info
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
+        prev_url = self._env.page.url
         obs, reward, terminated, truncated, info = self._env.step(action)
+
+        # Detect URL-based step transition and wait for React to render.
+        current_url = self._env.page.url
+        prev_step = _get_step_from_url(prev_url)
+        curr_step = _get_step_from_url(current_url)
+        if prev_step is not None and curr_step is not None and curr_step > prev_step:
+            _wait_for_content(self._env.page)
+            self._dismiss_overlays()
+            obs = self._env._get_obs()
+
+        self._dismiss_overlays()
         obs_text = extract_obs_text(obs, self.pruner)
         return obs_text, reward, terminated, truncated, info
 
