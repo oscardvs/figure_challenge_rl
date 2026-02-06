@@ -1,0 +1,32 @@
+# Challenge configuration
+
+base_url: "https://serene-frangipane-7fd25b.netlify.app"
+num_challenges: 30
+
+# Per-challenge settings
+defaults:
+  max_steps: 25
+  timeout_seconds: 30
+  viewport:
+    width: 1280
+    height: 720
+  headless: true
+
+# MCTS data collection
+mcts:
+  iterations_per_challenge: 15
+  candidates_per_node: 5  # K actions sampled at each node
+  exploration_constant: 1.4  # UCB1 c parameter
+  q_blend_alpha: 0.7  # weight for MCTS Q vs critic Q
+  min_q_diff_for_dpo: 0.2  # minimum Q-value gap for preference pairs
+
+# Reward configuration
+reward:
+  success: 1.0
+  failure: 0.0
+  step_penalty: 0.0  # no step penalty — binary reward only
+
+# Parallel execution (submission time)
+parallel:
+  num_workers: 4
+  total_time_budget_seconds: 300  # 5 minutes
