@@ -2,11 +2,15 @@
 
 Ported from ``AgentChallengeSolver._solve_step()`` in
 ``agent_solver_to_port.py``.  All Playwright calls are **synchronous**.
+
+Uses Gemini vision as a fallback on attempts 1+ when heuristics fail,
+matching the reference implementation's architecture.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass, field
@@ -37,13 +41,116 @@ class SolveResult:
 
 
 class DeterministicSolver:
-    """Deterministic solver — no LLM calls, pure heuristics + Playwright."""
+    """Heuristic solver with optional Gemini vision fallback."""
 
-    def __init__(self, max_attempts: int = 15, step_timeout: float = 45.0):
+    def __init__(
+        self,
+        max_attempts: int = 15,
+        step_timeout: float = 45.0,
+        use_vision: bool | None = None,
+    ):
         self.max_attempts = max_attempts
         self.step_timeout = step_timeout
         self.detector = ChallengeDetector()
         self.handlers = ChallengeHandlers()
+
+        # Auto-detect: enable vision if GOOGLE_API_KEY is set
+        if use_vision is None:
+            use_vision = bool(os.environ.get("GOOGLE_API_KEY"))
+        self.use_vision = use_vision
+        self._vision = None
+
+    def _get_vision(self):
+        """Lazy-init vision fallback."""
+        if self._vision is None:
+            from src.solver.vision_fallback import VisionFallback
+            self._vision = VisionFallback()
+        return self._vision
+
+    def _vision_attempt(
+        self,
+        page,
+        step_number: int,
+        attempt: int,
+        failed_codes: list[str],
+        result: SolveResult,
+        submit_is_trap: bool,
+        action_history: list[str],
+    ) -> SolveResult:
+        """Run one Gemini vision fallback attempt."""
+        from src.solver.vision_fallback import execute_vision_action
+
+        vision = self._get_vision()
+
+        # Clear popups and scroll to a useful position before screenshot
+        clear_popups(page)
+        if attempt % 3 == 0:
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        elif attempt % 3 == 1:
+            page.evaluate("window.scrollTo(0, 0)")
+        else:
+            page.evaluate("window.scrollTo(0, 500)")
+        time.sleep(0.3)
+
+        # Take screenshot
+        try:
+            screenshot = page.screenshot(type="png")
+        except Exception as e:
+            logger.warning("Screenshot failed: %s", e)
+            return result
+
+        html = page.content()
+        dom_codes = extract_hidden_codes(html)
+
+        logger.info("Step %d attempt %d: asking Gemini vision...", step_number, attempt)
+
+        action = vision.analyze(
+            screenshot_bytes=screenshot,
+            html_snippet=html[:6000],
+            step=step_number,
+            attempt=attempt,
+            dom_codes=dom_codes,
+            failed_codes=failed_codes,
+            history=action_history[-5:],
+        )
+
+        # If Gemini found a code, try it immediately
+        if action.code_found:
+            code = action.code_found.upper().strip()
+            if len(code) == 6 and code not in failed_codes:
+                logger.info("Vision found code: %s", code)
+                ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                if ok:
+                    result.success = True
+                    result.code_found = code
+                    return result
+                failed_codes.append(code)
+
+        # Execute the vision action
+        action_desc = execute_vision_action(page, action)
+        result.actions_log.append(f"vision: {action_desc}")
+        logger.info("Vision action: %s", action_desc)
+
+        # After action, check progress
+        if check_progress(page.url, step_number):
+            result.success = True
+            return result
+
+        # Try DOM codes revealed by the action
+        time.sleep(0.3)
+        html = page.content()
+        new_codes = extract_hidden_codes(html)
+        for code in new_codes:
+            if code in failed_codes:
+                continue
+            ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+            if ok:
+                result.success = True
+                result.code_found = code
+                return result
+            failed_codes.append(code)
+
+        return result
 
     def solve_step(self, page, step_number: int) -> SolveResult:
         """Solve the current step.  *page* must already be at the step."""
@@ -797,7 +904,16 @@ class DeterministicSolver:
                 result.success = True
                 break
 
-            # 8. Periodic retries
+            # 8. Gemini vision fallback (like the reference implementation)
+            if self.use_vision and attempt >= 1:
+                result = self._vision_attempt(
+                    page, step_number, attempt, failed_codes, result,
+                    submit_is_trap, action_history=result.actions_log,
+                )
+                if result.success:
+                    break
+
+            # 9. Periodic retries
             if attempt >= 3 and attempt % 3 == 0:
                 html_text = page.evaluate("() => document.body.textContent || ''")
                 html_lower = html_text.lower()
@@ -823,7 +939,7 @@ class DeterministicSolver:
                 if result.success:
                     break
 
-            # 9. Hide stuck modals at attempt 5
+            # 10. Hide stuck modals at attempt 5
             if attempt == 5:
                 from src.solver.challenge_handlers import _hide_stuck_modals
                 hidden = _hide_stuck_modals(page)
