@@ -144,6 +144,7 @@ class LLMPolicy:
             score = float(re.search(r"(\d+\.?\d*)", response_text).group(1))
             return max(0.0, min(1.0, score))
         except (AttributeError, ValueError):
+            logger.warning("Failed to parse critic score from: %.100s", response_text)
             return 0.5
 
     def select_action(

@@ -113,7 +113,7 @@ def generate_reasoning(
     obs_truncated = obs_text[:3000] if len(obs_text) > 3000 else obs_text
 
     cache_key = hashlib.md5(
-        f"{obs_truncated[:500]}|{action}".encode()
+        f"{obs_truncated}|{action}".encode()
     ).hexdigest()
 
     if cache_key in cache:

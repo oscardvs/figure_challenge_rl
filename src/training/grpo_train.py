@@ -238,8 +238,10 @@ def compute_grpo_loss(
                 dtype=torch.float32, device=model.device,
             )
 
-            # Per-token importance ratio.
+            # Per-token importance ratio with safety clamping on log-space
+            # to prevent exp() overflow when policies diverge significantly.
             log_ratio = current_token_log_probs - old_lp_tensor
+            log_ratio = torch.clamp(log_ratio, -10.0, 10.0)
             ratio = torch.exp(log_ratio)
             clipped_ratio = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
 

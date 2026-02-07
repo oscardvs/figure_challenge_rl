@@ -69,6 +69,11 @@ class HybridAgent:
 
             if not traj.success and self.policy is not None:
                 logger.info("Step %d: deterministic failed, falling back to LLM", step)
+                # Refresh observation after deterministic attempt may have mutated page
+                try:
+                    obs_text, _, _, _, _ = env.step("noop()")
+                except Exception:
+                    pass
                 llm_traj = self._solve_step_llm(env, obs_text, step)
                 if llm_traj.success:
                     traj = llm_traj
