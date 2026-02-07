@@ -315,4 +315,13 @@ class ChallengeDetector:
         _add(ChallengeType.UNKNOWN, 0.1)
 
         results.sort(key=lambda r: r.confidence, reverse=True)
+
+        # Log when only fallback detectors fired — helps identify
+        # unrecognized challenge types that need new detectors.
+        if results and results[0].challenge_type == ChallengeType.DOM_EXTRACTION:
+            active_signals = {k: v for k, v in s.items()
+                              if v and v is not False and v != 0}
+            logger.info("No specific challenge detected. Active signals: %s",
+                        active_signals)
+
         return results

@@ -7,6 +7,7 @@ Ported from ``AgentChallengeSolver._solve_step()`` in
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 
@@ -51,6 +52,7 @@ class DeterministicSolver:
         failed_codes: list[str] = []
         submit_is_trap = False
         scroll_attempted = False
+        failed_handler_types: set[str] = set()  # Track handlers that returned no codes
 
         # Wait for content
         for _ in range(10):
@@ -354,8 +356,11 @@ class DeterministicSolver:
                     time.sleep(1.5)
                     fresh_deep = deep_code_extraction(page, set(failed_codes))
                     all_to_try = list(dict.fromkeys(
-                        (fresh_deep or []) + (deep_codes or []) + list(codes or []) + list(failed_codes)
+                        (fresh_deep or []) + (deep_codes or []) + list(codes or [])
                     ))
+                    # Only try valid 6-char codes (exclude failed_codes and invalid entries)
+                    all_to_try = [c for c in all_to_try
+                                  if c not in failed_codes and re.fullmatch(r"[A-Z0-9]{6}", c)]
                     for code in all_to_try[:10]:
                         if _try_animated_button_submit_with_check(page, code, step_number):
                             result.success = True
@@ -483,13 +488,25 @@ class DeterministicSolver:
             # 4. Detection-based handling for subsequent attempts
             detections = self.detector.detect(page)
             if detections:
-                best = detections[0]
+                # Skip handler types that already returned no codes
+                best = None
+                for det in detections:
+                    if det.challenge_type.name not in failed_handler_types:
+                        best = det
+                        break
+                if best is None:
+                    best = detections[0]  # All handlers failed — retry best
+
                 result.challenge_type = best.challenge_type
                 logger.info("Step %d attempt %d: detected %s (%.2f)",
                             step_number, attempt, best.challenge_type.name, best.confidence)
 
                 hr = self.handlers.handle(page, best.challenge_type, step_number, failed_codes)
                 result.actions_log.extend(hr.actions_log)
+
+                # Track handlers that returned no usable codes
+                if not hr.success and not hr.codes_found:
+                    failed_handler_types.add(best.challenge_type.name)
 
                 if hr.success:
                     result.success = True
