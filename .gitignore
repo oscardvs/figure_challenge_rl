@@ -5,7 +5,10 @@ venv/
 # Environment variables
 .env
 .env.local
-data/snapshots/
+
+# Data directories
+data/
+
 # Python
 __pycache__/
 *.pyc
@@ -13,8 +16,6 @@ __pycache__/
 *.pyd
 .Python
 *.so
-data/expert_preferences_pairs/
-data/expert_trajectories/
 
 # IDE
 .idea/
@@ -28,9 +29,3 @@ agent_*.json
 
 # Package
 *.zip
-.venv/
-__pycache__/
-*.pyc
-
-data/*
-/data/expert_*/
