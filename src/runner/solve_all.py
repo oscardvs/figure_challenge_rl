@@ -5,9 +5,11 @@ The challenge is a sequential 30-step gauntlet (not 30 independent challenges).
 The agent must solve each step in order to advance to the next.
 
 Usage:
-    python -m src.runner.solve_all                    # API model, full gauntlet
-    python -m src.runner.solve_all --mode api          # Explicit API mode
-    python -m src.runner.solve_all --provider openai   # Use GPT-4o instead
+    python -m src.runner.solve_all                              # API model, full gauntlet
+    python -m src.runner.solve_all --mode api                   # Explicit API mode
+    python -m src.runner.solve_all --mode deterministic         # Deterministic solver only (no LLM cost)
+    python -m src.runner.solve_all --mode hybrid --provider google  # Deterministic + LLM fallback
+    python -m src.runner.solve_all --provider openai            # Use GPT-4o instead
 """
 
 from __future__ import annotations
@@ -135,9 +137,87 @@ def solve_gauntlet_api(
     return run_metrics
 
 
+def solve_gauntlet_deterministic(challenge_config: dict) -> RunMetrics:
+    """Solve the full gauntlet using only the deterministic solver (no LLM cost)."""
+    from src.solver import DeterministicSolver, HybridAgent
+
+    defaults = challenge_config["defaults"]
+
+    env = GauntletEnv(
+        headless=defaults["headless"],
+        max_actions_per_step=defaults.get("max_actions_per_step", 30),
+    )
+
+    agent = HybridAgent(policy=None, deterministic_first=True)
+    run_metrics = RunMetrics()
+    run_metrics.start()
+
+    try:
+        trajectories = agent.solve_gauntlet(env)
+
+        for traj in trajectories:
+            run_metrics.add_challenge(ChallengeMetrics(
+                challenge_id=traj.step_number,
+                success=traj.success,
+                steps=len(traj.actions),
+                elapsed_seconds=traj.elapsed_seconds,
+            ))
+    except Exception as e:
+        logger.error(f"Gauntlet error: {e}", exc_info=True)
+    finally:
+        env.close()
+
+    run_metrics.finish()
+    return run_metrics
+
+
+def solve_gauntlet_hybrid(
+    policy: LLMPolicy,
+    challenge_config: dict,
+) -> RunMetrics:
+    """Solve with deterministic solver first, LLM fallback for failures."""
+    from src.solver import HybridAgent
+
+    defaults = challenge_config["defaults"]
+
+    env = GauntletEnv(
+        headless=defaults["headless"],
+        max_actions_per_step=defaults.get("max_actions_per_step", 30),
+    )
+
+    agent = HybridAgent(
+        policy=policy,
+        deterministic_first=True,
+        max_llm_actions=defaults.get("max_actions_per_step", 20),
+    )
+    run_metrics = RunMetrics()
+    run_metrics.start()
+
+    try:
+        trajectories = agent.solve_gauntlet(env)
+
+        for traj in trajectories:
+            run_metrics.add_challenge(ChallengeMetrics(
+                challenge_id=traj.step_number,
+                success=traj.success,
+                steps=len(traj.actions),
+                elapsed_seconds=traj.elapsed_seconds,
+            ))
+    except Exception as e:
+        logger.error(f"Gauntlet error: {e}", exc_info=True)
+    finally:
+        env.close()
+
+    run_metrics.finish()
+    return run_metrics
+
+
 def main():
     parser = argparse.ArgumentParser(description="Solve the 30-step gauntlet")
-    parser.add_argument("--mode", default="api", choices=["api", "local"])
+    parser.add_argument(
+        "--mode", default="api",
+        choices=["api", "deterministic", "hybrid", "local"],
+    )
     parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai", "google"])
     parser.add_argument("--model", default=None)
     parser.add_argument("--output", default=None, help="Metrics output path")
@@ -146,7 +226,10 @@ def main():
     challenge_config, model_config = load_configs()
     output_path = args.output or str(PROJECT_ROOT / "results" / "metrics.json")
 
-    if args.mode == "api":
+    if args.mode == "deterministic":
+        run_metrics = solve_gauntlet_deterministic(challenge_config)
+
+    elif args.mode in ("api", "hybrid"):
         api_cfg = model_config["api_models"]
         if args.model:
             model = args.model
@@ -165,7 +248,10 @@ def main():
             temperature=api_cfg.get("temperature", 0.7),
         )
 
-        run_metrics = solve_gauntlet_api(policy, challenge_config)
+        if args.mode == "api":
+            run_metrics = solve_gauntlet_api(policy, challenge_config)
+        else:
+            run_metrics = solve_gauntlet_hybrid(policy, challenge_config)
 
     elif args.mode == "local":
         raise NotImplementedError(

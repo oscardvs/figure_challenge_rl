@@ -43,3 +43,28 @@ reward:
 parallel:
   num_workers: 1
   total_time_budget_seconds: 300
+
+# Known challenge types (randomized per run — any type can appear at any step)
+challenge_types:
+  - dom_extraction       # Code visible in DOM text or hidden elements
+  - math_puzzle          # Arithmetic expression to solve, enter result
+  - keyboard_sequence    # Press specific key sequence
+  - radio_brute_force    # Try radio button combinations + submit
+  - scroll_to_find       # Scroll through long page, avoid trap buttons
+  - hover_reveal         # Hover over elements to reveal hidden code
+  - timing_capture       # Capture code during timed reveal
+  - multi_tab            # Visit multiple tabs to collect code fragments
+  - sequence_challenge   # Click/hover/type in specific sequence
+  - video_frames         # Navigate video frames to find code
+  - split_parts          # Collect code parts scattered across page
+  - rotating_code        # Capture code that rotates/changes rapidly
+  - delayed_reveal       # Wait for delayed code reveal
+  - drag_and_drop        # Drag elements to correct positions
+  - animated_button      # Click moving/animated button to submit
+  - shadow_dom           # Traverse nested shadow DOM layers
+  - canvas_draw          # Draw on canvas to reveal code
+  - audio_challenge      # Play audio and extract code
+  - websocket            # Connect to WebSocket server for code
+  - service_worker       # Register service worker to cache code
+  - iframe_recursive     # Navigate nested iframes to extract code
+  - mutation_observer    # Trigger and observe DOM mutations for code

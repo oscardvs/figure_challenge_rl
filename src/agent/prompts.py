@@ -94,10 +94,11 @@ def format_observation_message(observation_text: str, step: int) -> str:
 
 
 _ACTION_PATTERN = re.compile(
-    r"^(click|dblclick|fill|select_option|hover|press|focus|clear|"
+    r"^(click|dblclick|fill|type|select_option|hover|press|focus|clear|"
     r"scroll|drag_and_drop|upload_file|"
-    r"goto|go_back|go_forward|new_tab|tab_close|tab_focus|"
-    r"js_eval|send_msg_to_user|noop)\s*\(",
+    r"mouse_click|mouse_move|mouse_drag|mouse_upload_file|"
+    r"goto|go_back|go_forward|new_tab|tab_close|close_tab|tab_focus|"
+    r"js_eval|send_msg_to_user|report_infeasible|noop)\s*\(",
 )
 
 

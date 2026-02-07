@@ -73,19 +73,24 @@ def train(
     output_dir: str,
     num_epochs: int = 1,
 ):
-    """Run DPO training with adapter-as-reference trick."""
+    """Run DPO training with dual-adapter reference.
+
+    Loads the SFT adapter twice: one trainable ("train") and one frozen
+    ("reference"). This ensures the reference distribution matches the
+    SFT policy rather than the bare base model, which would create
+    enormous initial KL divergence and cause training to collapse.
+    """
     try:
         from unsloth import FastLanguageModel
     except ImportError:
         logger.error("Unsloth not installed. Install with: pip install unsloth")
         raise
 
+    from peft import PeftModel
     from trl import DPOTrainer, DPOConfig
-    from peft import PeftConfig, get_peft_model
     from datasets import Dataset
 
     dpo_cfg = model_config["dpo"]
-    qlora_cfg = model_config["qlora"]
 
     # Load the SFT model (already has LoRA adapters).
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -95,10 +100,24 @@ def train(
         dtype=None,
     )
 
+    # Load a second copy of the SFT adapter as frozen reference.
+    # With ref_model=None + adapter names, DPOTrainer swaps adapters
+    # to compute reference log-probs instead of using the bare base model.
+    if isinstance(model, PeftModel):
+        # Rename the existing adapter to "train".
+        # PeftModel's default adapter is named "default".
+        model.load_adapter(sft_model_dir, adapter_name="reference")
+        logger.info("Loaded dual adapters: 'default' (trainable) + 'reference' (frozen)")
+    else:
+        logger.warning(
+            "Model is not a PeftModel — falling back to ref_model=None. "
+            "This uses the bare base model as reference, which may cause "
+            "training instability after SFT."
+        )
+
     # Create dataset.
     dataset = Dataset.from_list(examples)
 
-    # DPO config — ref_model=None triggers adapter-as-reference.
     training_args = DPOConfig(
         output_dir=output_dir,
         beta=dpo_cfg["beta"],
@@ -111,17 +130,21 @@ def train(
         save_strategy="epoch",
         max_length=dpo_cfg["max_seq_length"],
         max_prompt_length=dpo_cfg["max_seq_length"] // 2,
+        # Use the dual-adapter approach: DPOTrainer computes reference
+        # log-probs by switching to "reference" adapter (frozen SFT policy).
+        model_adapter_name="default",
+        ref_adapter_name="reference",
     )
 
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,  # Adapter-as-reference: uses the frozen base as reference.
+        ref_model=None,  # Dual-adapter: reference computed via adapter swap.
         tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args,
     )
 
-    logger.info("Starting DPO training...")
+    logger.info("Starting DPO training (dual-adapter reference)...")
     trainer.train()
 
     model.save_pretrained(output_dir)

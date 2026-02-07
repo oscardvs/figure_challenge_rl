@@ -7,6 +7,12 @@ world model — since the challenge pages are fast-loading React SPAs.
 
 The key data product: trajectories and step-level preference pairs
 for downstream SFT, DPO, and M-GRPO training.
+
+Architecture note: each MCTS iteration replays actions from root rather
+than snapshotting browser state, because Playwright/CDP doesn't support
+reliable SPA state snapshots. To mitigate the replay cost, iterations
+replay only the *tree path* actions within the current step (not prior
+steps, which are handled once during env.reset via prior_solutions).
 """
 
 from __future__ import annotations
@@ -174,7 +180,13 @@ class MCTSSearch:
         return self.trajectories
 
     def _run_iteration(self, initial_obs: str, iteration: int) -> Trajectory:
-        """Run a single MCTS iteration: select → expand → simulate → backprop."""
+        """Run a single MCTS iteration: select → replay → expand → simulate → backprop.
+
+        After env.reset(), the browser is at the target step's initial state.
+        We first SELECT a path through the existing tree using UCB1, then
+        REPLAY those actions in the browser to reach the frontier node, then
+        EXPAND with a new action and SIMULATE until terminal.
+        """
         steps: list[TrajectoryStep] = []
         action_history: list[str] = []
         current_obs = initial_obs
@@ -182,16 +194,57 @@ class MCTSSearch:
         total_reward = 0.0
         start_time = time.time()
 
-        for step_idx in range(self.env.max_actions):
-            # Phase 1: Selection — walk existing tree with UCB1.
-            while not current_node.is_leaf and not current_node.is_fully_expanded:
-                action_str = self._ucb1_select(current_node)
-                if action_str in current_node.children:
-                    current_node = current_node.children[action_str]
-                else:
-                    break
+        # Phase 1: SELECTION — walk existing tree with UCB1 to find
+        # the frontier node. Collect the path of actions to replay.
+        selection_path: list[tuple[MCTSNode, str]] = []
+        while (
+            not current_node.is_leaf
+            and current_node.children
+            and not current_node.is_fully_expanded is False  # has children
+        ):
+            # If node has unexpanded actions, stop here for expansion.
+            if not current_node.is_fully_expanded:
+                break
+            action_str = self._ucb1_select(current_node)
+            if action_str is None or action_str not in current_node.children:
+                break
+            selection_path.append((current_node, action_str))
+            current_node = current_node.children[action_str]
 
-            # Phase 2: Expansion — get LLM candidates if needed.
+        # Phase 2: REPLAY — execute the selected path actions in the browser
+        # to reach the frontier node's state.
+        for node, action_str in selection_path:
+            try:
+                obs_text, reward, terminated, truncated, info = self.env.step(action_str)
+                action_history.append(action_str)
+                current_obs = obs_text
+                total_reward = max(total_reward, reward)
+                if terminated or truncated:
+                    # Path led to terminal state during replay — backprop and return.
+                    self._backpropagate(current_node, total_reward)
+                    return Trajectory(
+                        step_number=self.env.step_number,
+                        steps=steps,
+                        total_reward=total_reward,
+                        success=total_reward > 0,
+                        duration_seconds=time.time() - start_time,
+                    )
+            except Exception as e:
+                logger.warning(f"Replay action failed: {e}")
+                self._backpropagate(current_node, 0.0)
+                return Trajectory(
+                    step_number=self.env.step_number,
+                    steps=steps,
+                    total_reward=0.0,
+                    success=False,
+                    duration_seconds=time.time() - start_time,
+                )
+
+        # Phase 3: EXPANSION + SIMULATION — from the frontier, expand with
+        # a new action then simulate to terminal.
+        step_idx = len(action_history)
+        for _ in range(self.env.max_actions - step_idx):
+            # Get candidates if this is a leaf or has unexpanded actions.
             if current_node.is_leaf or not current_node.is_fully_expanded:
                 if not current_node.unexpanded_actions:
                     candidates = self.policy.propose_actions(
@@ -203,14 +256,12 @@ class MCTSSearch:
                     )
                     current_node.unexpanded_actions = candidates
 
-                # Pick the best unexpanded action.
                 if current_node.unexpanded_actions:
                     candidate = current_node.unexpanded_actions.pop(0)
                     action_str = candidate.action
                     reasoning = candidate.reasoning
                     critic_score = candidate.critic_score
                 else:
-                    # Fallback: direct policy query.
                     action_str, reasoning = self.policy.select_action(
                         obs_text=current_obs,
                         task_prompt=self.task_prompt,
@@ -219,12 +270,11 @@ class MCTSSearch:
                     )
                     critic_score = 0.5
             else:
-                # Tree is fully expanded at this node — use UCB1.
                 action_str = self._ucb1_select(current_node)
                 reasoning = ""
                 critic_score = 0.5
 
-            # Phase 3: Simulation — execute action in real browser.
+            # Execute action in browser.
             try:
                 obs_text, reward, terminated, truncated, info = self.env.step(action_str)
             except Exception as e:
@@ -237,13 +287,12 @@ class MCTSSearch:
 
             total_reward = max(total_reward, reward)
 
-            # Record step.
             step_data = TrajectoryStep(
                 obs_text=current_obs,
                 action=action_str,
                 reasoning=reasoning,
                 reward=reward,
-                q_value=0.0,  # Will be updated during backpropagation.
+                q_value=0.0,
                 critic_score=critic_score,
                 step_index=step_idx,
                 state_hash=_hash_state(current_obs),
@@ -269,11 +318,12 @@ class MCTSSearch:
 
             current_node = child_node
             current_obs = obs_text
+            step_idx += 1
 
             if terminated or truncated:
                 break
 
-        # Phase 4: Backpropagation.
+        # Phase 4: BACKPROPAGATION.
         self._backpropagate(current_node, total_reward)
 
         # Update Q-values on trajectory steps.

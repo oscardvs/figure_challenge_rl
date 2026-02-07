@@ -46,9 +46,15 @@ def generate_rollout(
 ) -> dict:
     """Generate a single rollout using the local model.
 
-    Returns dict with: messages, actions, reward, success, log_probs.
+    Returns dict with: messages, actions, reward, success, old_log_probs.
+    old_log_probs is a list of per-action entries, each containing:
+      - token_ids: list[int] — generated token IDs for this action
+      - token_log_probs: list[float] — per-token log-probs under the old policy
+      - prompt_length: int — length of the prompt prefix (for re-computing)
     """
     import torch
+
+    from src.agent.prompts import parse_action_from_response
 
     obs_text, _ = env.reset()
     messages = [
@@ -56,7 +62,7 @@ def generate_rollout(
         {"role": "user", "content": f"{task_prompt}\n\n[Step 0] Current page state:\n{obs_text}"},
     ]
     actions = []
-    log_probs_list = []
+    old_log_probs = []
     total_reward = 0.0
 
     for step in range(max_steps):
@@ -65,6 +71,7 @@ def generate_rollout(
             messages, tokenize=False, add_generation_prompt=True,
         )
         inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+        prompt_length = inputs["input_ids"].shape[1]
 
         # Generate action with log probs.
         with torch.no_grad():
@@ -77,21 +84,25 @@ def generate_rollout(
                 output_scores=True,
             )
 
-        generated_ids = outputs.sequences[0][inputs["input_ids"].shape[1]:]
+        generated_ids = outputs.sequences[0][prompt_length:]
         response_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-        # Compute log probabilities of generated tokens.
-        scores = outputs.scores  # tuple of (vocab_size,) tensors
-        step_log_probs = []
+        # Compute per-token log probabilities under the old (current) policy.
+        scores = outputs.scores  # tuple of (vocab_size,) logit tensors
+        token_log_probs = []
         for i, score in enumerate(scores):
             if i < len(generated_ids):
-                token_id = generated_ids[i]
+                token_id = generated_ids[i].item()
                 log_prob = torch.nn.functional.log_softmax(score[0], dim=-1)
-                step_log_probs.append(log_prob[token_id].item())
-        log_probs_list.append(sum(step_log_probs))
+                token_log_probs.append(log_prob[token_id].item())
+
+        old_log_probs.append({
+            "token_ids": generated_ids.tolist(),
+            "token_log_probs": token_log_probs,
+            "prompt_length": prompt_length,
+        })
 
         # Parse action from response.
-        from src.agent.prompts import parse_action_from_response
         action = parse_action_from_response(response_text)
         actions.append(action)
 
@@ -119,7 +130,7 @@ def generate_rollout(
         "actions": actions,
         "reward": total_reward,
         "success": total_reward > 0,
-        "log_probs": log_probs_list,
+        "old_log_probs": old_log_probs,
     }
 
 
@@ -132,10 +143,11 @@ def compute_grpo_loss(
 ):
     """Compute M-GRPO loss for a group of rollouts.
 
-    Group Relative Policy Optimization:
-    - Compute advantages relative to group mean (no value network).
-    - Clip importance weights.
-    - Add KL penalty against initial policy.
+    Proper Group Relative Policy Optimization:
+    - Compute group-relative advantages (no value network needed).
+    - Re-compute per-token log-probs under the *current* policy via forward pass.
+    - Compute per-token importance ratios against stored old log-probs.
+    - Apply clipped surrogate objective + KL penalty.
     """
     import torch
 
@@ -143,60 +155,91 @@ def compute_grpo_loss(
     mean_reward = np.mean(rewards)
     std_reward = np.std(rewards) + 1e-8
 
-    total_loss = torch.tensor(0.0, device=model.device, requires_grad=True)
-    num_terms = 0
+    total_loss = torch.tensor(0.0, device=model.device)
+    num_tokens = 0
 
     for rollout in group_rollouts:
-        # Group-relative advantage.
+        # Group-relative advantage (trajectory-level).
         advantage = (rollout["reward"] - mean_reward) / std_reward
 
-        if advantage == 0:
+        if abs(advantage) < 1e-8:
             continue
 
-        # For each action in the rollout, compute the policy gradient.
-        for msg_idx, action_log_prob_old in enumerate(rollout["log_probs"]):
-            # Re-compute log prob under current policy.
-            # (In practice, we'd re-tokenize and forward pass here.)
-            # For simplicity, approximate with stored log probs + gradient.
+        adv_tensor = torch.tensor(advantage, dtype=torch.float32, device=model.device)
+
+        # For each action turn in the rollout, compute per-token loss.
+        for msg_idx, old_lp_data in enumerate(rollout["old_log_probs"]):
+            # Reconstruct the prompt (messages up to this action turn).
             messages_so_far = rollout["messages"][:2 + msg_idx * 2]
             if not messages_so_far:
                 continue
 
+            old_token_ids = old_lp_data["token_ids"]
+            old_token_log_probs = old_lp_data["token_log_probs"]
+            if not old_token_ids or not old_token_log_probs:
+                continue
+
+            # Build the full sequence: prompt + generated tokens.
             input_text = tokenizer.apply_chat_template(
                 messages_so_far, tokenize=False, add_generation_prompt=True,
             )
-            inputs = tokenizer(
+            prompt_ids = tokenizer(
                 input_text, return_tensors="pt", truncation=True, max_length=8192,
-            ).to(model.device)
+            )["input_ids"].to(model.device)
 
-            # Get current policy log prob.
-            assistant_msg = rollout["messages"][2 + msg_idx * 2] if (2 + msg_idx * 2) < len(rollout["messages"]) else None
-            if not assistant_msg or assistant_msg["role"] != "assistant":
+            gen_ids = torch.tensor([old_token_ids], device=model.device)
+            full_ids = torch.cat([prompt_ids, gen_ids], dim=1)
+
+            # Forward pass to get current policy logits.
+            outputs = model(input_ids=full_ids)
+            logits = outputs.logits  # (1, seq_len, vocab_size)
+
+            # Extract logits at positions corresponding to generated tokens.
+            # logits[t] predicts token[t+1], so logits at prompt_len-1 .. prompt_len+gen_len-2
+            # predict tokens at prompt_len .. prompt_len+gen_len-1 (the generated tokens).
+            prompt_len = prompt_ids.shape[1]
+            gen_len = min(len(old_token_ids), len(old_token_log_probs))
+            if gen_len == 0:
                 continue
 
-            target_text = assistant_msg["content"]
-            target_ids = tokenizer(target_text, return_tensors="pt")["input_ids"].to(model.device)
+            # Slice logits for the generated span.
+            gen_logits = logits[0, prompt_len - 1 : prompt_len - 1 + gen_len, :]
+            gen_log_probs = torch.nn.functional.log_softmax(gen_logits, dim=-1)
 
-            outputs = model(**inputs, labels=inputs["input_ids"])
-            log_prob_new = -outputs.loss  # Approximate; negative NLL.
+            # Gather log-probs for the actual generated tokens.
+            gen_token_tensor = torch.tensor(
+                old_token_ids[:gen_len], device=model.device
+            )
+            current_token_log_probs = gen_log_probs.gather(
+                -1, gen_token_tensor.unsqueeze(-1)
+            ).squeeze(-1)  # (gen_len,)
 
-            # Importance ratio.
-            ratio = torch.exp(log_prob_new - action_log_prob_old)
+            # Old log-probs (detached, from rollout generation).
+            old_lp_tensor = torch.tensor(
+                old_token_log_probs[:gen_len],
+                dtype=torch.float32, device=model.device,
+            )
+
+            # Per-token importance ratio.
+            log_ratio = current_token_log_probs - old_lp_tensor
+            ratio = torch.exp(log_ratio)
             clipped_ratio = torch.clamp(ratio, 1 - clip_epsilon, 1 + clip_epsilon)
 
-            # Clipped surrogate loss.
-            adv_tensor = torch.tensor(advantage, device=model.device)
+            # Clipped surrogate objective (per-token, same advantage for all tokens
+            # in a trajectory since rewards are trajectory-level).
             surr1 = ratio * adv_tensor
             surr2 = clipped_ratio * adv_tensor
-            loss_term = -torch.min(surr1, surr2)
+            token_loss = -torch.min(surr1, surr2)
 
-            # KL penalty (approximate).
-            kl_term = kl_coefficient * (log_prob_new - action_log_prob_old) ** 2
-            total_loss = total_loss + loss_term + kl_term
-            num_terms += 1
+            # KL penalty per token.
+            kl_penalty = kl_coefficient * (current_token_log_probs - old_lp_tensor)
+            token_loss = token_loss + kl_penalty
 
-    if num_terms > 0:
-        total_loss = total_loss / num_terms
+            total_loss = total_loss + token_loss.sum()
+            num_tokens += gen_len
+
+    if num_tokens > 0:
+        total_loss = total_loss / num_tokens
 
     return total_loss
 

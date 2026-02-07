@@ -10,12 +10,16 @@ RL-trained browser agent that solves a 30-step sequential web navigation gauntle
 src/
   agent/       — LLM policy, MCTS search, prompts/action parsing
   environment/ — BrowserGym wrappers (GauntletEnv, StepEnv), action space, observation pruning
+  solver/      — Deterministic challenge solver (21 challenge types), hybrid agent
   training/    — SFT, DPO, GRPO training + MCTS trajectory collection
-  runner/      — solve_all.py (baseline), metrics, parallel executor
+  runner/      — solve_all.py (baseline + deterministic + hybrid modes), metrics, parallel executor
 config/        — challenge_config.yaml, model_config.yaml
 data/          — trajectories, preference_pairs, known_solutions.json
 scripts/       — debug_run.py, explore_challenges.py
 ```
+
+### Randomized Challenges
+Challenges are **randomized per run** — challenge type X can appear at any step position, and codes are dynamically generated each time. This means `known_solutions.json` and `StepEnv` with `prior_solutions` are only useful for training on fixed challenge sets. For randomized challenges, use `GauntletEnv` (sequential from step 1) with the deterministic solver or hybrid agent.
 
 ## Key Files & What They Do
 - `src/environment/browser_env.py` — GauntletEnv (full 30-step), StepEnv (single-step for training). Handles SPA content-wait (`_wait_for_content`), overlay dismissal, step transition detection, prior solution replay.
@@ -27,24 +31,28 @@ scripts/       — debug_run.py, explore_challenges.py
 - `src/training/sft_train.py` — Supervised fine-tuning (Qwen2.5-3B + QLoRA via Unsloth).
 - `src/training/dpo_train.py` — DPO training from preference pairs.
 - `src/training/grpo_train.py` — Group-relative policy optimization with live rollouts.
+- `src/solver/challenge_detector.py` — `ChallengeDetector` classifies the current page into one of 21 challenge types via a single `page.evaluate()` JS signal collection call.
+- `src/solver/challenge_handlers.py` — `ChallengeHandlers` with 21 per-type handler methods + shared utilities (`clear_popups`, `fill_and_submit`, `extract_hidden_codes`, `deep_code_extraction`). All sync Playwright.
+- `src/solver/deterministic_solver.py` — `DeterministicSolver` orchestrates the per-step solve loop: detect → handle → extract codes → submit → check progress.
+- `src/solver/hybrid_agent.py` — `HybridAgent` wraps `DeterministicSolver` + optional `LLMPolicy`. Deterministic-first, LLM-fallback for each step.
 
 ## Important Patterns & Gotchas
 
-### Step Transition: Mandatory Reload Pattern
-BrowserGym's `set_of_marks` injects `bid`/`browsergym_visibility_ratio` attributes into ALL DOM elements during `_get_obs()`. This crashes React's virtual DOM reconciliation. On **initial page load** (step 1 or after `page.reload()`), React fully hydrates before `_get_obs()` runs, so the AXTree is captured with full content (~2000+ chars). But after **SPA navigation** (step transitions), React is still rendering when `_get_obs()` fires `set_of_marks`, causing React to abort mid-render → sparse obs (~618 chars with only header elements).
+### Step Transition: Context-Manager Protected Observation
+BrowserGym's `set_of_marks` injects `bid`/`browsergym_visibility_ratio` attributes into ALL DOM elements during `_get_obs()`. This crashes React's virtual DOM reconciliation. The `_pre_extract_disabled()` context manager disables DOM mutation during `_env.step()` and guarantees restoration via `try/finally`, even on exceptions.
 
-**Fix**: `_wait_and_refresh_obs()` always calls `page.reload(wait_until="networkidle")` on step transitions to force fresh React hydration (like initial load). It then calls `_wait_for_content()` → `_dismiss_overlays()` → `_get_obs()`. If the resulting obs_text is still < 1000 chars, it retries up to 2 more times.
+After step transitions, `_wait_for_content()` uses a multi-signal approach: first waits for `#root > *` mount, then waits for interactive elements (buttons, inputs) to confirm puzzle content rendered. Only reloads as a last resort. `_get_reliable_obs()` retries observation extraction up to 3 times with exponential backoff.
 
-**Critical**: Use `len(obs_text) >= 1000` to check obs quality, NOT `len(axtree.children) >= 3`. Header elements like "Step 2 of 30" survive React crashes and satisfy the children count, but puzzle content is missing. The obs_text length after pruning is the reliable signal.
+**Observation quality check**: `_is_obs_valid()` checks for interactive elements (button/textbox/input/etc.) AND minimum length > 500 chars, rather than raw length alone. Some legitimate steps produce short AXTrees.
 
 The `__bgym_js_result` div is cleaned up on step transitions to prevent result accumulation ("JS Result: JS Result: ...").
 
-`_wait_for_content()` uses `page.wait_for_selector("#root > *")` with a reload fallback if React doesn't mount within 5s.
+Step transitions are detected via URL matching with DOM fallback: if the URL doesn't reflect a step change, the DOM is checked for "Step N of 30" text.
 
 ### Action Parser
 `_ACTION_PATTERN` in `prompts.py` must include ALL valid BrowserGym actions. If a new action is added to the action set, it MUST be added to this regex or it will silently become `noop()`.
 
-Current valid actions: `click`, `dblclick`, `fill`, `select_option`, `hover`, `press`, `focus`, `clear`, `scroll`, `drag_and_drop`, `upload_file`, `goto`, `go_back`, `go_forward`, `new_tab`, `tab_close`, `tab_focus`, `js_eval`, `send_msg_to_user`, `noop`.
+Current valid actions: `click`, `dblclick`, `fill`, `type`, `select_option`, `hover`, `press`, `focus`, `clear`, `scroll`, `drag_and_drop`, `upload_file`, `mouse_click`, `mouse_move`, `mouse_drag`, `mouse_upload_file`, `goto`, `go_back`, `go_forward`, `new_tab`, `tab_close`, `close_tab`, `tab_focus`, `js_eval`, `send_msg_to_user`, `report_infeasible`, `noop`.
 
 ### Custom Actions (js_eval)
 BrowserGym custom actions receive `page` (Playwright Page) via `exec()` globals — NOT as a function parameter. The function body references `page` directly. Function must have a docstring with an `Examples:` section.
@@ -61,9 +69,11 @@ python scripts/debug_run.py  # 15 actions on step 1, dumps observations
 
 ### Baseline Run (full gauntlet)
 ```bash
-python -m src.runner.solve_all --provider google      # Gemini Flash
-python -m src.runner.solve_all --provider anthropic    # Claude Sonnet
-python -m src.runner.solve_all --provider openai       # GPT-4o
+python -m src.runner.solve_all --provider google      # Gemini Flash (API mode)
+python -m src.runner.solve_all --provider anthropic    # Claude Sonnet (API mode)
+python -m src.runner.solve_all --provider openai       # GPT-4o (API mode)
+python -m src.runner.solve_all --mode deterministic    # Deterministic solver only (no LLM cost)
+python -m src.runner.solve_all --mode hybrid --provider google  # Deterministic + LLM fallback
 ```
 Results written to `results/metrics.json`.
 

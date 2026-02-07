@@ -77,44 +77,58 @@ def _get_step_from_url(url: str) -> int | None:
 def _wait_for_content(page, timeout: float = 5.0):
     """Wait until React renders content into #root after SPA navigation.
 
-    Uses Playwright's wait_for_selector for robust waiting that handles page
-    loads correctly. Falls back to page reload if React doesn't render.
+    Multi-signal approach:
+    1. Wait for React root to have children (basic mount check).
+    2. Wait for interactive elements (puzzle content, not just headers).
+    3. Fall back to reload only as last resort (destroys React state).
     """
+    # Signal 1: Wait for React root to mount content.
     try:
         page.wait_for_selector(
             "#root > *", state="attached", timeout=timeout * 1000
         )
-        # Give React a moment to finish rendering after first element appears.
-        time.sleep(0.3)
-        return
     except Exception:
+        # React root empty — reload as fallback.
+        logger.warning("React did not render, reloading page")
+        try:
+            page.reload(wait_until="networkidle", timeout=10000)
+        except Exception as e:
+            logger.warning(f"Page reload failed: {e}")
+            return
+        try:
+            page.wait_for_selector(
+                "#root > *", state="attached", timeout=timeout * 1000
+            )
+        except Exception:
+            logger.warning("React still empty after reload")
+            return
+
+    # Signal 2: Wait for interactive puzzle content (not just the header).
+    # The step header renders first; puzzle content renders after.
+    try:
+        page.wait_for_selector(
+            "button, input, [role='textbox'], canvas, [role='slider']",
+            state="attached",
+            timeout=3000,
+        )
+    except Exception:
+        # Some steps may not have standard interactive elements.
         pass
 
-    # React didn't render — reload to force fresh hydration.
-    logger.warning("React did not render, reloading page")
-    try:
-        page.reload(wait_until="networkidle", timeout=10000)
-    except Exception as e:
-        logger.warning(f"Page reload failed: {e}")
-        return
-
-    try:
-        page.wait_for_selector(
-            "#root > *", state="attached", timeout=timeout * 1000
-        )
-        time.sleep(0.3)
-    except Exception:
-        logger.warning("React still empty after reload")
+    # Brief settle time for React to finish any remaining renders.
+    time.sleep(0.3)
 
 
 import browsergym.core.observation as _browsergym_obs_mod
+from contextlib import contextmanager
 
 # Keep a reference to the real _pre_extract so we can restore it.
 _original_pre_extract = _browsergym_obs_mod._pre_extract
 
 
-def _disable_pre_extract():
-    """Temporarily make _pre_extract a no-op to prevent React crashes.
+@contextmanager
+def _pre_extract_disabled():
+    """Context manager to temporarily disable _pre_extract for React safety.
 
     BrowserGym's _pre_extract injects DOM attributes (bid, set_of_marks,
     visibility_ratio) into all elements. If React is mid-transition (unmounting
@@ -125,13 +139,56 @@ def _disable_pre_extract():
     validate() runs without any DOM mutation. The returned obs has no bids
     but React stays alive. We then re-extract with _pre_extract enabled
     when React is in a stable state.
+
+    Uses a context manager with try/finally to guarantee restoration even
+    if an exception occurs during step execution.
     """
     _browsergym_obs_mod._pre_extract = lambda page, **kw: None
+    try:
+        yield
+    finally:
+        _browsergym_obs_mod._pre_extract = _original_pre_extract
 
 
-def _enable_pre_extract():
-    """Restore the real _pre_extract."""
-    _browsergym_obs_mod._pre_extract = _original_pre_extract
+def _is_obs_valid(obs_text: str) -> bool:
+    """Check whether an observation contains meaningful puzzle content.
+
+    A length-only check is unreliable: some legitimate steps produce short
+    AXTrees, while failed extractions can exceed 1000 chars with boilerplate.
+    Instead, check for interactive elements that indicate puzzle content.
+    """
+    lower = obs_text.lower()
+    has_interactive = any(
+        kw in lower
+        for kw in ("button", "textbox", "input", "slider", "checkbox", "link", "combobox")
+    )
+    # Ensure we have more than just the header ("Step N of 30").
+    return has_interactive and len(obs_text) > 500
+
+
+def _get_reliable_obs(env, page, pruner, max_retries: int = 3) -> str:
+    """Extract observation with retries and exponential backoff.
+
+    On SPA transitions, React may not have finished rendering when CDP
+    extracts the accessibility snapshot. Retry with increasing delays to
+    give React time to settle.
+    """
+    from src.environment.observation import extract_obs_text
+
+    for attempt in range(max_retries):
+        if attempt > 0:
+            time.sleep(0.5 * (attempt + 1))  # 1s, 1.5s
+        obs = env._get_obs()
+        obs_text = extract_obs_text(obs, pruner)
+        if _is_obs_valid(obs_text):
+            return obs_text
+
+    # Return best effort after retries.
+    logger.warning(
+        f"Observation still sparse after {max_retries} retries "
+        f"({len(obs_text)} chars)"
+    )
+    return obs_text
 
 
 class GauntletTask(AbstractBrowserTask):
@@ -481,16 +538,9 @@ class GauntletEnv:
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
         # Disable _pre_extract during _env.step() to prevent React crash.
-        # BrowserGym's _pre_extract mutates the DOM (adds bid, set_of_marks
-        # attributes). If React is mid-transition (SPA navigation between
-        # steps), these mutations crash React permanently. By disabling
-        # _pre_extract, the action executes and validate() runs without
-        # DOM mutation. We then re-extract obs ourselves when React is stable.
-        _disable_pre_extract()
-        try:
+        # Context manager guarantees restoration even if step() throws.
+        with _pre_extract_disabled():
             _, reward, terminated, truncated, info = self._env.step(action)
-        finally:
-            _enable_pre_extract()
 
         task_info = info.get("task_info", info)
         current_step = task_info.get("current_step", self._prev_step)
@@ -498,15 +548,14 @@ class GauntletEnv:
         # On step transition, wait for React to finish rendering new step.
         if self._prev_step is not None and current_step > self._prev_step:
             self._cleanup_js_result()
-            time.sleep(2.0)
+            time.sleep(1.0)
             _wait_for_content(self._env.page)
 
         self._prev_step = current_step
         self._dismiss_overlays()
 
-        # Re-extract obs with _pre_extract enabled (React is now stable).
-        obs = self._env._get_obs()
-        obs_text = extract_obs_text(obs, self.pruner)
+        # Re-extract obs with _pre_extract enabled and retry logic.
+        obs_text = _get_reliable_obs(self._env, self._env.page, self.pruner)
 
         return obs_text, reward, terminated, truncated, info
 
@@ -601,24 +650,37 @@ class StepEnv:
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:
         prev_url = self._env.page.url
 
-        _disable_pre_extract()
-        try:
+        with _pre_extract_disabled():
             _, reward, terminated, truncated, info = self._env.step(action)
-        finally:
-            _enable_pre_extract()
 
-        # Detect URL-based step transition.
+        # Detect step transition via URL or DOM content.
         current_url = self._env.page.url
         prev_step = _get_step_from_url(prev_url)
         curr_step = _get_step_from_url(current_url)
-        if prev_step is not None and curr_step is not None and curr_step > prev_step:
+
+        step_transitioned = (
+            prev_step is not None
+            and curr_step is not None
+            and curr_step > prev_step
+        )
+        if not step_transitioned:
+            # Fallback: check DOM for step indicator in case URL didn't update yet.
+            try:
+                dom_text = self._env.page.inner_text("body", timeout=1000)
+                dom_match = re.search(r"step\s*(\d+)\s*of\s*30", dom_text, re.IGNORECASE)
+                if dom_match and prev_step is not None:
+                    dom_step = int(dom_match.group(1))
+                    step_transitioned = dom_step > prev_step
+            except Exception:
+                pass
+
+        if step_transitioned:
             self._cleanup_js_result()
-            time.sleep(2.0)
+            time.sleep(1.0)
             _wait_for_content(self._env.page)
 
         self._dismiss_overlays()
-        obs = self._env._get_obs()
-        obs_text = extract_obs_text(obs, self.pruner)
+        obs_text = _get_reliable_obs(self._env, self._env.page, self.pruner)
         return obs_text, reward, terminated, truncated, info
 
     def close(self):
