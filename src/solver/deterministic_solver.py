@@ -160,12 +160,8 @@ class DeterministicSolver:
         submit_is_trap = False
         scroll_attempted = False
 
-        # Wait for content
-        for _ in range(10):
-            html = page.content()
-            if len(html) > 1000 and ("button" in html.lower() or "input" in html.lower()):
-                break
-            time.sleep(0.5)
+        # Wait for React SPA to render meaningful content
+        _wait_for_page_ready(page)
 
         for attempt in range(self.max_attempts):
             elapsed = time.time() - t0
@@ -959,6 +955,48 @@ class DeterministicSolver:
             if detections and detections[0].challenge_type != ChallengeType.UNKNOWN:
                 result.challenge_type = detections[0].challenge_type
         return result
+
+
+def _wait_for_page_ready(page, timeout: float = 10.0):
+    """Wait for React SPA to render meaningful content.
+
+    Uses Playwright's wait_for_selector for efficient waiting (no busy-polling),
+    with page reload as fallback if React fails to mount.
+    """
+    # 1. Wait for React root to mount children
+    try:
+        page.wait_for_selector(
+            "#root > *", state="attached", timeout=timeout * 1000
+        )
+    except Exception:
+        # React root empty — try reload
+        logger.warning("React did not render in %.1fs, reloading page", timeout)
+        try:
+            page.reload(wait_until="networkidle", timeout=10000)
+        except Exception as e:
+            logger.warning("Page reload failed: %s", e)
+            return
+        try:
+            page.wait_for_selector(
+                "#root > *", state="attached", timeout=timeout * 1000
+            )
+        except Exception:
+            logger.warning("React still empty after reload")
+            return
+
+    # 2. Wait for interactive elements (puzzle content, not just headers)
+    try:
+        page.wait_for_selector(
+            "button, input, [role='textbox'], canvas, [role='slider']",
+            state="attached",
+            timeout=5000,
+        )
+    except Exception:
+        # Some steps may not have standard interactive elements
+        pass
+
+    # 3. Brief settle time for React to finish remaining renders
+    time.sleep(0.3)
 
 
 def _try_animated_button_submit_with_check(page, code: str, step: int) -> bool:
