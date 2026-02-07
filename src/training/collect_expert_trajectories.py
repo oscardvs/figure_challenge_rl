@@ -214,17 +214,26 @@ def main():
                 if traj["success"]:
                     total_successful += 1
 
-        # Save trajectories.
+        # Merge with existing trajectories (append, don't overwrite).
         out_path = output_dir / f"step_{step_num:02d}.json"
+        existing: list = []
+        if out_path.exists():
+            try:
+                existing = json.loads(out_path.read_text())
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        merged = existing + step_trajectories
         with open(out_path, "w") as f:
-            json.dump(step_trajectories, f, indent=2)
+            json.dump(merged, f, indent=2)
+        new_succ = sum(1 for t in step_trajectories if t["success"])
         logger.info(
-            f"Step {step_num}: {sum(1 for t in step_trajectories if t['success'])}/"
-            f"{len(step_trajectories)} successful, saved to {out_path}"
+            f"Step {step_num}: {new_succ}/{len(step_trajectories)} successful "
+            f"(total: {len(merged)} trajectories), saved to {out_path}"
         )
 
-        # Generate and save preference pairs.
-        pairs = generate_preference_pairs(step_trajectories, step_num)
+        # Generate and save preference pairs (merge with existing).
+        all_for_pairs = merged  # Generate pairs from all trajectories for this step.
+        pairs = generate_preference_pairs(all_for_pairs, step_num)
         if pairs:
             pairs_path = pairs_dir / f"step_{step_num:02d}.json"
             with open(pairs_path, "w") as f:

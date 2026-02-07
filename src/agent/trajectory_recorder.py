@@ -24,16 +24,39 @@ from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# Patterns that indicate a page.evaluate() call modifies DOM state
-# (as opposed to read-only queries used for detection/extraction).
-_SIDE_EFFECT_PATTERNS = re.compile(
-    r"\.click\(\)|\.dispatchEvent|\.remove\(\)|\.scrollTo|\.scrollTop\s*="
-    r"|\.value\s*=|\.textContent\s*=|\.innerHTML\s*=|\.style\."
-    r"|\.focus\(\)|\.blur\(\)|\.select\(\)|\.submit\(\)"
-    r"|\.setAttribute|\.removeAttribute|\.classList\."
-    r"|\.appendChild|\.insertBefore|\.replaceChild"
-    r"|\.checked\s*=|\.disabled\s*=|\.hidden\s*="
-    r"|window\.scrollTo|window\.scroll\(",
+# ---------------------------------------------------------------------------
+# Side-effect classification for page.evaluate() calls
+# ---------------------------------------------------------------------------
+
+# JS patterns that represent MEANINGFUL agent actions (not cleanup/utility).
+# Only these are recorded as side-effect actions.
+_AGENT_ACTION_PATTERNS = re.compile(
+    r"window\.scrollTo|window\.scroll\("
+    r"|\.scrollTop\s*=\s*\w"  # el.scrollTop = N (scroll container)
+    r"|\.dispatchEvent\s*\(\s*new\s+(Drag|Mouse|Keyboard|Input|Pointer)Event"
+    r"|\.value\s*=\s*['\"]"  # input.value = "code"
+    r"|\.checked\s*=\s*true"  # radio.checked = true
+    r"|\.focus\(\)",
+    re.IGNORECASE,
+)
+
+# JS patterns that are UTILITY/CLEANUP — never recorded even if they
+# technically modify the DOM. These are popup dismissal, overlay hiding, etc.
+_UTILITY_PATTERNS = re.compile(
+    r"\.style\.display\s*=\s*['\"]none"
+    r"|\.style\.pointerEvents\s*=\s*['\"]none"
+    r"|\.style\.visibility\s*=\s*['\"]hidden"
+    r"|\.style\.zIndex\s*=\s*['\"]?-"
+    r"|el\.remove\(\)|\.remove\(\)\s*;?\s*cleared"  # clear_popups pattern
+    r"|let\s+cleared\s*=\s*0"  # clear_popups boilerplate
+    r"|hide\s*\(\s*el\s*\)",
+    re.IGNORECASE,
+)
+
+# Loose pattern: JS that MIGHT click buttons inside forEach loops (solver
+# handler utility actions). Only recorded if NOT also matching utility.
+_LOOSE_CLICK_PATTERN = re.compile(
+    r"\.click\(\)",
     re.IGNORECASE,
 )
 
@@ -59,38 +82,109 @@ class RecordedTrajectory:
     code_found: str | None = None
     elapsed_seconds: float = 0.0
 
-    def to_sft_format(self) -> dict:
+    def to_sft_format(self, max_steps: int = 25) -> dict:
         """Convert to format expected by sft_train.py load_trajectories().
 
         Returns a dict with keys: step_number, success, steps.
         Each step has: step_index, obs_text, action, reasoning.
-        Only includes side-effect actions (skips read-only queries).
+
+        Filters: only side-effect actions, deduplicated, capped at max_steps.
         """
-        steps = []
-        for i, act in enumerate(self.actions):
+        steps: list[dict] = []
+        prev_action: str | None = None
+        dup_count = 0
+
+        for act in self.actions:
             if not act.side_effect:
                 continue
+
+            action = act.browsergym_action
+
+            # Deduplicate consecutive identical actions.
+            if action == prev_action:
+                dup_count += 1
+                # Allow at most 3 consecutive identical actions.
+                if dup_count >= 3:
+                    continue
+            else:
+                dup_count = 0
+
+            prev_action = action
             steps.append({
                 "step_index": len(steps),
                 "obs_text": act.obs_text,
-                "action": act.browsergym_action,
+                "action": action,
                 "reasoning": "",  # Filled in later by generate_cot.py
             })
+
+            if len(steps) >= max_steps:
+                break
+
+        # Validate code_found — must be exactly 6 uppercase alphanumeric chars.
+        # The solver sometimes attributes success to the wrong code (e.g.,
+        # "Submit") when the URL happened to advance from an earlier fill.
+        code = self.code_found
+        if not code or not re.fullmatch(r"[A-Z0-9]{6}", code):
+            code = _extract_code_from_actions(steps)
 
         return {
             "step_number": self.step_number,
             "challenge_type": self.challenge_type,
             "success": self.success,
-            "code_found": self.code_found,
+            "code_found": code,
             "elapsed_seconds": self.elapsed_seconds,
             "steps": steps,
         }
 
 
-def _is_side_effect(js_code: str) -> bool:
-    """Heuristic: does this JS expression modify the DOM?"""
-    if isinstance(js_code, str):
-        return bool(_SIDE_EFFECT_PATTERNS.search(js_code))
+_CODE_RE = re.compile(r'["\']([A-Z0-9]{6})["\']')
+
+
+def _extract_code_from_actions(steps: list[dict]) -> str | None:
+    """Try to find the 6-char code from fill() or js_eval() actions in the trajectory."""
+    # First pass: look for fill() actions (most reliable).
+    for step in reversed(steps):
+        action = step.get("action", "")
+        if action.startswith("fill("):
+            m = _CODE_RE.search(action)
+            if m:
+                return m.group(1)
+    # Second pass: look for js_eval() actions that inject a code into an input
+    # (solver uses React-compatible setter: s.call(inp, 'CODE')).
+    for step in reversed(steps):
+        action = step.get("action", "")
+        if action.startswith("js_eval(") and "input" in action.lower():
+            m = _CODE_RE.search(action)
+            if m:
+                return m.group(1)
+    return None
+
+
+def _classify_js(js_code: str) -> bool:
+    """Classify a JS expression: True = meaningful agent action, False = skip.
+
+    Three-tier classification:
+    1. If it matches utility patterns → skip (False)
+    2. If it matches agent action patterns → record (True)
+    3. If it has .click() but not utility → record (True)
+    4. Otherwise → skip (False)
+    """
+    if not isinstance(js_code, str):
+        return False
+
+    # Utility/cleanup JS — never record.
+    if _UTILITY_PATTERNS.search(js_code):
+        return False
+
+    # Explicit agent actions — always record.
+    if _AGENT_ACTION_PATTERNS.search(js_code):
+        return True
+
+    # Loose click pattern: record if it clicks buttons (handler logic)
+    # but doesn't look like utility.
+    if _LOOSE_CLICK_PATTERN.search(js_code):
+        return True
+
     return False
 
 
@@ -108,7 +202,6 @@ class RecordingKeyboard:
 
     def type(self, text: str, **kwargs):
         """Record as fill() action, then delegate."""
-        # Get the currently focused element's bid for the fill action.
         focused_bid = self._recorder._get_focused_bid()
         action_str = f'fill("{focused_bid}", "{_escape_for_action(text)}")'
         self._recorder._record_action(action_str, side_effect=True)
@@ -139,6 +232,7 @@ class RecordingMouse:
         self._recorder = recorder
         self._drag_start: tuple[float, float] | None = None
         self._is_down = False
+        self._last_move: tuple[float, float] = (0, 0)
 
     def click(self, x: float, y: float, **kwargs):
         """Record as mouse_click() action."""
@@ -153,9 +247,9 @@ class RecordingMouse:
 
     def move(self, x: float, y: float, **kwargs):
         """Record mouse_move or accumulate for drag."""
+        self._last_move = (x, y)
         if self._is_down:
             # Part of a drag — will be recorded on mouse.up()
-            self._last_move = (x, y)
             return self._mouse.move(x, y, **kwargs)
         action_str = f'mouse_move({x:.0f}, {y:.0f})'
         self._recorder._record_action(action_str, side_effect=True)
@@ -164,16 +258,15 @@ class RecordingMouse:
     def down(self, **kwargs):
         """Start of a drag — record start position."""
         self._is_down = True
-        self._drag_start = self._last_move if hasattr(self, "_last_move") else (0, 0)
+        self._drag_start = self._last_move
         return self._mouse.down(**kwargs)
 
     def up(self, **kwargs):
         """End of a drag — record as mouse_drag()."""
         result = self._mouse.up(**kwargs)
         if self._is_down and self._drag_start is not None:
-            end = self._last_move if hasattr(self, "_last_move") else (0, 0)
             sx, sy = self._drag_start
-            ex, ey = end
+            ex, ey = self._last_move
             action_str = f'mouse_drag({sx:.0f}, {sy:.0f}, {ex:.0f}, {ey:.0f})'
             self._recorder._record_action(action_str, side_effect=True)
         self._is_down = False
@@ -227,6 +320,9 @@ class RecordingPage:
 
     Intercepts solver Playwright calls, captures observations before each
     action, and maps calls to BrowserGym action format.
+
+    Observation capture is throttled: at most once every `obs_interval`
+    seconds, reusing the last observation for intermediate actions.
     """
 
     def __init__(
@@ -235,6 +331,7 @@ class RecordingPage:
         obs_extractor_fn,
         step_number: int,
         challenge_type: str,
+        obs_interval: float = 2.0,
     ):
         """
         Args:
@@ -243,14 +340,17 @@ class RecordingPage:
                 Signature: () -> str
             step_number: Current step number being solved.
             challenge_type: Detected challenge type string.
+            obs_interval: Minimum seconds between observation captures.
         """
         self._page = real_page
         self._obs_extractor_fn = obs_extractor_fn
         self._step_number = step_number
         self._challenge_type = challenge_type
+        self._obs_interval = obs_interval
         self._actions: list[RecordedAction] = []
         self._start_time = time.time()
         self._last_obs: str = ""
+        self._last_obs_time: float = 0.0
 
         # Initialize proxies.
         self.keyboard = RecordingKeyboard(real_page.keyboard, self)
@@ -267,14 +367,19 @@ class RecordingPage:
             return "0"
 
     def _capture_obs(self) -> str:
-        """Capture current observation for recording."""
-        try:
-            obs = self._obs_extractor_fn()
-            self._last_obs = obs
-            return obs
-        except Exception as e:
-            logger.warning(f"Observation capture failed: {e}")
-            return self._last_obs
+        """Capture current observation, throttled by obs_interval.
+
+        Only calls the (expensive) obs_extractor_fn if enough time has
+        elapsed since the last capture. Otherwise reuses the cached obs.
+        """
+        now = time.time()
+        if now - self._last_obs_time >= self._obs_interval or not self._last_obs:
+            try:
+                self._last_obs = self._obs_extractor_fn()
+                self._last_obs_time = now
+            except Exception as e:
+                logger.warning(f"Observation capture failed: {e}")
+        return self._last_obs
 
     def _record_action(self, action_str: str, side_effect: bool = True):
         """Record an action with its pre-action observation."""
@@ -289,12 +394,15 @@ class RecordingPage:
     def evaluate(self, expression, arg=None):
         """Intercept page.evaluate() calls.
 
-        Maps to js_eval(code) for side-effect expressions.
-        Read-only expressions are recorded but marked as non-side-effect.
+        Uses _classify_js() to determine if the JS represents a meaningful
+        agent action (scrollTo, button click, form fill) vs utility/cleanup
+        (popup dismissal, style changes). Only meaningful actions are recorded.
         """
-        is_se = _is_side_effect(expression if isinstance(expression, str) else "")
+        is_agent_action = _classify_js(
+            expression if isinstance(expression, str) else ""
+        )
 
-        if is_se:
+        if is_agent_action:
             escaped = _escape_for_action(
                 expression if isinstance(expression, str) else str(expression)
             )
