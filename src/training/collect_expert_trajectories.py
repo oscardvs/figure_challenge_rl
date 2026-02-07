@@ -68,13 +68,13 @@ def collect_step(
     from src.environment.browser_env import GauntletEnv
     from src.environment.observation import AXTreePruner
     from src.solver.challenge_detector import ChallengeDetector
-    from src.solver.deterministic_solver import DeterministicSolver
+    from src.solver.deterministic_solver import DeterministicSolver, _wait_for_page_ready
 
     env = GauntletEnv(
         headless=config.get("headless", True),
         max_actions_per_step=30,
     )
-    solver = DeterministicSolver(max_attempts=15, step_timeout=25.0)
+    solver = DeterministicSolver(max_attempts=15, step_timeout=45.0)
     detector = ChallengeDetector()
     pruner = AXTreePruner(visible_only=False, with_bid_only=True, target_tokens=2000)
 
@@ -89,8 +89,8 @@ def collect_step(
             if not result.success:
                 logger.warning(f"  Run {run_index}: failed to solve pre-step {s}")
                 return None
-            # Wait for step transition.
-            time.sleep(1.0)
+            # Wait for next step's React content to render.
+            _wait_for_page_ready(page)
 
         # Now record the target step.
         logger.info(f"  Run {run_index}: recording step {step_number}")
