@@ -29,13 +29,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def load_preference_pairs(data_dir: Path) -> list[dict]:
-    """Load preference pairs from collected data."""
+    """Load preference pairs from collected data.
+
+    Globs both challenge_*.json (MCTS pairs) and step_*.json (expert pairs).
+    """
     pairs = []
-    for path in sorted(data_dir.glob("challenge_*.json")):
-        with open(path) as f:
-            challenge_pairs = json.load(f)
-        pairs.extend(challenge_pairs)
-    logger.info(f"Loaded {len(pairs)} preference pairs")
+    for pattern in ("challenge_*.json", "step_*.json"):
+        for path in sorted(data_dir.glob(pattern)):
+            with open(path) as f:
+                file_pairs = json.load(f)
+            pairs.extend(file_pairs)
+    logger.info(f"Loaded {len(pairs)} preference pairs from {data_dir}")
     return pairs
 
 
@@ -155,6 +159,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Stage 2: DPO Training")
     parser.add_argument("--data-dir", default=str(PROJECT_ROOT / "data" / "preference_pairs"))
+    parser.add_argument("--expert-pairs-dir", default=str(PROJECT_ROOT / "data" / "expert_preference_pairs"))
     parser.add_argument("--sft-model", default=str(PROJECT_ROOT / "models" / "sft"))
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "models" / "dpo"))
     parser.add_argument("--epochs", type=int, default=1)
@@ -163,11 +168,20 @@ def main():
     with open(PROJECT_ROOT / "config" / "model_config.yaml") as f:
         model_config = yaml.safe_load(f)
 
-    from src.agent.prompts import format_system_prompt
+    from src.agent.prompts import format_pure_agent_system_prompt
     from src.environment.action_space import get_action_description
-    system_prompt = format_system_prompt(get_action_description())
+    system_prompt = format_pure_agent_system_prompt(get_action_description())
 
+    # Load MCTS preference pairs.
     pairs = load_preference_pairs(Path(args.data_dir))
+
+    # Load expert preference pairs.
+    expert_dir = Path(args.expert_pairs_dir)
+    if expert_dir.exists():
+        expert_pairs = load_preference_pairs(expert_dir)
+        pairs.extend(expert_pairs)
+        logger.info(f"Combined: {len(pairs)} total preference pairs")
+
     if not pairs:
         logger.error("No preference pairs found. Run data collection first.")
         sys.exit(1)

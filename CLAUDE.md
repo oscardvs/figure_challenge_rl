@@ -102,6 +102,37 @@ python -m src.training.grpo_train      # GRPO with live rollouts
 - Playwright browsers: `playwright install chromium`
 - Key deps: `browsergym-core`, `playwright`, `torch`, `transformers`, `trl`, `unsloth`, `vllm`
 
+## Expert Trajectory Pipeline (Pure Learned Agent)
+
+### Overview
+The deterministic solver acts as a **teacher**: it generates expert trajectories that a Qwen2.5-3B model learns from. At inference time, the trained agent solves challenges from observations alone — no hardcoded detectors or handlers.
+
+### Pipeline
+1. **Collect expert trajectories**: `python -m src.training.collect_expert_trajectories`
+   - Runs solver with `RecordingPage` proxy that intercepts Playwright calls and maps to BrowserGym actions.
+   - Output: `data/expert_trajectories/step_NN.json` + `data/expert_preference_pairs/step_NN.json`
+2. **Add CoT reasoning**: `python -m src.training.generate_cot`
+   - Uses Gemini Flash to annotate each (obs, action) pair with 2-4 sentence reasoning.
+   - Output: Updated trajectory files with `reasoning` field.
+3. **SFT**: `python -m src.training.sft_train --expert-dir data/expert_trajectories`
+   - Combines MCTS + expert trajectories. Expert trajectories use `PURE_AGENT_SYSTEM_PROMPT`.
+4. **DPO**: `python -m src.training.dpo_train --expert-pairs-dir data/expert_preference_pairs`
+   - Combines MCTS + expert preference pairs.
+5. **M-GRPO**: `python -m src.training.grpo_train`
+   - Uses `GauntletEnv` (randomized challenges) with fractional reward and curriculum learning.
+
+### Key Files
+- `src/agent/trajectory_recorder.py` — `RecordingPage` proxy (Playwright → BrowserGym action mapping)
+- `src/agent/prompts.py` — `PURE_AGENT_SYSTEM_PROMPT` (no challenge-type hints)
+- `src/training/collect_expert_trajectories.py` — Expert trajectory collection
+- `src/training/generate_cot.py` — Synthetic chain-of-thought annotation
+- `src/environment/observation.py` — `extract_html_snippet()` for enhanced observations
+
+### Data Directories
+- `data/expert_trajectories/` — Solver-generated trajectories in SFT format
+- `data/expert_preference_pairs/` — Success/failure contrast pairs for DPO
+- `data/cot_cache.json` — API response cache for CoT generation
+
 ## Code Style
 - Type hints everywhere (`from __future__ import annotations`)
 - Logging via `logging.getLogger(__name__)`

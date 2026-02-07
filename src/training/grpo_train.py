@@ -43,20 +43,27 @@ def generate_rollout(
     max_steps: int = 25,
     max_new_tokens: int = 512,
     temperature: float = 1.0,
+    is_gauntlet: bool = False,
+    curriculum_max_steps: int = 30,
 ) -> dict:
     """Generate a single rollout using the local model.
 
-    Returns dict with: messages, actions, reward, success, old_log_probs.
+    Returns dict with: messages, actions, reward, success, old_log_probs,
+    steps_completed.
+
     old_log_probs is a list of per-action entries, each containing:
       - token_ids: list[int] — generated token IDs for this action
       - token_log_probs: list[float] — per-token log-probs under the old policy
       - prompt_length: int — length of the prompt prefix (for re-computing)
+
+    When is_gauntlet=True, reward is fractional (steps_completed / 30.0)
+    instead of binary.
     """
     import torch
 
     from src.agent.prompts import parse_action_from_response
 
-    obs_text, _ = env.reset()
+    obs_text, info = env.reset()
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": f"{task_prompt}\n\n[Step 0] Current page state:\n{obs_text}"},
@@ -64,6 +71,7 @@ def generate_rollout(
     actions = []
     old_log_probs = []
     total_reward = 0.0
+    steps_completed = 0
 
     for step in range(max_steps):
         # Tokenize conversation.
@@ -113,7 +121,16 @@ def generate_rollout(
             logger.warning(f"Rollout step error: {e}")
             break
 
-        total_reward = max(total_reward, reward)
+        # Track cumulative reward.
+        if is_gauntlet:
+            task_info = info.get("task_info", info)
+            steps_completed = task_info.get("steps_completed", steps_completed)
+            total_reward = steps_completed / 30.0
+            # Curriculum: stop after reaching max steps for this epoch.
+            if steps_completed >= curriculum_max_steps:
+                terminated = True
+        else:
+            total_reward = max(total_reward, reward)
 
         # Update messages.
         messages.append({"role": "assistant", "content": response_text})
@@ -131,6 +148,7 @@ def generate_rollout(
         "reward": total_reward,
         "success": total_reward > 0,
         "old_log_probs": old_log_probs,
+        "steps_completed": steps_completed,
     }
 
 
@@ -251,7 +269,13 @@ def train(
     num_episodes: int = 500,
     group_size: int = 4,
 ):
-    """Run M-GRPO training loop."""
+    """Run M-GRPO training loop.
+
+    Supports two rollout modes:
+    - "gauntlet": Uses GauntletEnv with randomized challenges. Reward is
+      fractional (steps_completed / 30.0). Includes curriculum learning.
+    - "step": Original per-step mode using StepEnv with binary reward.
+    """
     import torch
 
     try:
@@ -260,13 +284,24 @@ def train(
         logger.error("Unsloth not installed.")
         raise
 
-    from src.agent.prompts import format_system_prompt, format_task_prompt
+    from src.agent.prompts import (
+        format_gauntlet_task_prompt,
+        format_pure_agent_system_prompt,
+        format_system_prompt,
+        format_task_prompt,
+    )
     from src.environment.action_space import get_action_description
-    from src.environment.browser_env import StepEnv
 
     grpo_cfg = model_config["grpo"]
+    rollout_mode = grpo_cfg.get("rollout_mode", "step")
+    curriculum_max_steps = grpo_cfg.get("curriculum_max_steps", 5)
+    is_gauntlet = rollout_mode == "gauntlet"
 
-    system_prompt = format_system_prompt(get_action_description())
+    action_desc = get_action_description()
+    if is_gauntlet:
+        system_prompt = format_pure_agent_system_prompt(action_desc)
+    else:
+        system_prompt = format_system_prompt(action_desc)
 
     # Load DPO model.
     model, tokenizer = FastLanguageModel.from_pretrained(
@@ -285,19 +320,30 @@ def train(
     challenges = list(range(1, 31))
     episodes_done = 0
     successes = 0
+    recent_rewards: list[float] = []  # For curriculum adjustment.
 
-    logger.info(f"Starting M-GRPO training: {num_episodes} episodes, group_size={group_size}")
+    logger.info(
+        f"Starting M-GRPO training: {num_episodes} episodes, "
+        f"group_size={group_size}, mode={rollout_mode}"
+    )
 
     while episodes_done < num_episodes:
-        # Sample a random step.
-        step_number = challenges[episodes_done % len(challenges)]
-        task_prompt = format_task_prompt(step_number)
-
-        env = StepEnv(
-            step_number=step_number,
-            max_actions=25,
-            headless=True,
-        )
+        if is_gauntlet:
+            from src.environment.browser_env import GauntletEnv
+            env = GauntletEnv(
+                headless=True,
+                max_actions_per_step=15,
+            )
+            task_prompt = format_gauntlet_task_prompt(current_step=1)
+        else:
+            from src.environment.browser_env import StepEnv
+            step_number = challenges[episodes_done % len(challenges)]
+            task_prompt = format_task_prompt(step_number)
+            env = StepEnv(
+                step_number=step_number,
+                max_actions=25,
+                headless=True,
+            )
 
         try:
             # Generate G rollouts (group).
@@ -310,6 +356,8 @@ def train(
                     task_prompt=task_prompt,
                     max_new_tokens=grpo_cfg["max_new_tokens"],
                     temperature=grpo_cfg["sampling_temperature"],
+                    is_gauntlet=is_gauntlet,
+                    curriculum_max_steps=curriculum_max_steps,
                 )
                 group_rollouts.append(rollout)
                 if rollout["success"]:
@@ -329,6 +377,7 @@ def train(
 
             episodes_done += group_size
             group_rewards = [r["reward"] for r in group_rollouts]
+            recent_rewards.extend(group_rewards)
 
             if episodes_done % 20 == 0:
                 logger.info(
@@ -336,7 +385,17 @@ def train(
                     f"loss={loss.item():.4f}, "
                     f"group_reward={np.mean(group_rewards):.2f}, "
                     f"success_rate={successes/episodes_done:.1%}"
+                    + (f", curriculum_steps={curriculum_max_steps}" if is_gauntlet else "")
                 )
+
+            # Curriculum adjustment: increase max steps when success rate is high.
+            if is_gauntlet and len(recent_rewards) >= 20:
+                avg_reward = np.mean(recent_rewards[-20:])
+                # If solving >60% of curriculum steps, expand.
+                if avg_reward > curriculum_max_steps * 0.6 / 30.0:
+                    curriculum_max_steps = min(30, curriculum_max_steps + 2)
+                    logger.info(f"Curriculum expanded to {curriculum_max_steps} steps")
+                recent_rewards = recent_rewards[-20:]
 
         except Exception as e:
             logger.error(f"Episode error: {e}", exc_info=True)

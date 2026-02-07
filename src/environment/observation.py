@@ -157,11 +157,43 @@ class AXTreePruner:
         return truncated
 
 
-def extract_obs_text(obs: dict, pruner: AXTreePruner) -> str:
+def extract_html_snippet(page, max_chars: int = 6000) -> str:
+    """Extract cleaned inner HTML of the main content area.
+
+    Removes script/style/noscript tags and truncates to *max_chars*.
+    *page* is a sync Playwright Page object.
+    """
+    try:
+        raw_html = page.evaluate("""\
+(() => {
+    const root = document.querySelector('#root') || document.body;
+    const clone = root.cloneNode(true);
+    clone.querySelectorAll('script, style, noscript, svg').forEach(el => el.remove());
+    return clone.innerHTML;
+})()""")
+    except Exception:
+        return ""
+
+    if not raw_html:
+        return ""
+
+    # Light cleanup: collapse whitespace runs.
+    cleaned = re.sub(r"\s{3,}", "  ", raw_html)
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars] + "\n[... HTML truncated ...]"
+    return cleaned
+
+
+def extract_obs_text(
+    obs: dict,
+    pruner: AXTreePruner,
+    html_snippet: str | None = None,
+) -> str:
     """Extract a text observation from a BrowserGym observation dict.
 
     Combines URL, page title, and pruned AXTree into a single string
-    suitable for LLM consumption.
+    suitable for LLM consumption. When *html_snippet* is provided,
+    appends it after the AXTree for richer context.
     """
     url = obs.get("url", "")
     titles = obs.get("open_pages_titles", [])
@@ -190,5 +222,8 @@ def extract_obs_text(obs: dict, pruner: AXTreePruner) -> str:
     if last_error:
         parts.append(f"Action error: {last_error}")
     parts.append(f"\nAccessibility Tree:\n{axtree}")
+
+    if html_snippet:
+        parts.append(f"\nHTML Content:\n{html_snippet}")
 
     return "\n".join(parts)

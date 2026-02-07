@@ -161,6 +161,7 @@ def train(
 def main():
     parser = argparse.ArgumentParser(description="Stage 1: SFT Training")
     parser.add_argument("--data-dir", default=str(PROJECT_ROOT / "data" / "trajectories"))
+    parser.add_argument("--expert-dir", default=str(PROJECT_ROOT / "data" / "expert_trajectories"))
     parser.add_argument("--output-dir", default=str(PROJECT_ROOT / "models" / "sft"))
     parser.add_argument("--epochs", type=int, default=3)
     args = parser.parse_args()
@@ -168,17 +169,37 @@ def main():
     with open(PROJECT_ROOT / "config" / "model_config.yaml") as f:
         model_config = yaml.safe_load(f)
 
-    from src.agent.prompts import format_system_prompt
+    from src.agent.prompts import (
+        format_pure_agent_system_prompt,
+        format_system_prompt,
+    )
     from src.environment.action_space import get_action_description
 
-    system_prompt = format_system_prompt(get_action_description())
+    action_desc = get_action_description()
+    system_prompt = format_system_prompt(action_desc)
+    pure_system_prompt = format_pure_agent_system_prompt(action_desc)
 
-    trajectories = load_trajectories(Path(args.data_dir))
-    if not trajectories:
+    # Load MCTS trajectories (use original system prompt).
+    mcts_trajectories = load_trajectories(Path(args.data_dir))
+    conversations = format_as_conversations(mcts_trajectories, system_prompt)
+
+    # Load expert trajectories (use pure agent system prompt).
+    expert_dir = Path(args.expert_dir)
+    if expert_dir.exists():
+        expert_trajectories = load_trajectories(expert_dir)
+        expert_conversations = format_as_conversations(
+            expert_trajectories, pure_system_prompt
+        )
+        conversations.extend(expert_conversations)
+        logger.info(
+            f"Combined: {len(mcts_trajectories)} MCTS + "
+            f"{len(expert_trajectories)} expert trajectories"
+        )
+
+    if not conversations:
         logger.error("No successful trajectories found. Run data collection first.")
         sys.exit(1)
 
-    conversations = format_as_conversations(trajectories, system_prompt)
     train(conversations, model_config, args.output_dir, args.epochs)
 
 

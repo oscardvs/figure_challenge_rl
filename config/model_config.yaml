@@ -21,7 +21,7 @@ qlora:
 
 # SFT training
 sft:
-  max_seq_length: 4096
+  max_seq_length: 6144  # Increased from 4096 for html_snippet in observations
   per_device_batch_size: 2
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
@@ -50,6 +50,8 @@ grpo:
   max_new_tokens: 512
   sampling_temperature: 1.0
   rollout_episodes: 500
+  rollout_mode: "gauntlet"     # "gauntlet" (GauntletEnv, randomized) or "step" (StepEnv, fixed)
+  curriculum_max_steps: 5      # Start with first N steps, expand as success rate improves
 
 # Inference
 inference:
