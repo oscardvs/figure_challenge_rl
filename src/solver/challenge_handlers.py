@@ -622,7 +622,7 @@ class ChallengeHandlers:
             ChallengeType.SERVICE_WORKER: lambda: self.handle_service_worker(page),
             ChallengeType.IFRAME_RECURSIVE: lambda: self.handle_iframe(page),
             ChallengeType.MUTATION_OBSERVER: lambda: self.handle_mutation(page),
-            ChallengeType.SCROLL_TO_FIND: lambda: self.handle_scroll_to_find(page, failed_codes),
+            ChallengeType.SCROLL_TO_FIND: lambda: self.handle_scroll_to_find(page, failed_codes, step),
             ChallengeType.HOVER_REVEAL: lambda: self.handle_hover_reveal(page),
             ChallengeType.DELAYED_REVEAL: lambda: self.handle_delayed_reveal(page),
             ChallengeType.DRAG_AND_DROP: lambda: self.handle_drag_and_drop(page),
@@ -1253,41 +1253,154 @@ class ChallengeHandlers:
             codes.append(final)
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
 
-    def handle_scroll_to_find(self, page, known_codes: list[str]) -> HandlerResult:
+    def handle_scroll_to_find(self, page, known_codes: list[str],
+                              step_number: int = 0) -> HandlerResult:
+        """Handle scroll-to-find challenges with progress checking after every action."""
         log: list[str] = []
         sorted_codes = sort_codes_by_priority(known_codes) if known_codes else []
+        SCROLL_TIMEOUT = 25
+        scroll_start = time.time()
+
+        def _expired():
+            return time.time() - scroll_start > SCROLL_TIMEOUT
+
+        def _progress():
+            return check_progress(page.url, step_number) if step_number else False
 
         if sorted_codes:
             _fill_code_in_input(page, sorted_codes[0])
 
-        # Phase 0: mouse.wheel scroll
+        # Phase 0: mouse.wheel scroll + progress checking at each position
         page.evaluate("window.scrollTo(0, 0)")
         time.sleep(0.2)
         prev_scroll_y = 0
         start = time.time()
+        phase0_codes: set[str] = set()
         while time.time() - start < 10:
             page.mouse.wheel(0, 800)
             time.sleep(0.10)
+            if _progress():
+                log.append("scroll: phase 0 auto-nav")
+                return HandlerResult(actions_log=log, success=True)
+            # Accumulate codes during scroll (virtualized content)
+            try:
+                vp_codes = page.evaluate("""() => {
+                    const text = document.body.innerText || '';
+                    return (text.match(/\\b[A-Z0-9]{6}\\b/g) || []).filter((v,i,a) => a.indexOf(v) === i);
+                }""")
+                phase0_codes.update(vp_codes or [])
+            except Exception:
+                pass
             cur_y = page.evaluate("() => window.scrollY")
             if cur_y <= prev_scroll_y and prev_scroll_y > 100:
                 for _ in range(5):
                     page.mouse.wheel(0, 800)
                     time.sleep(0.15)
+                    if _progress():
+                        log.append("scroll: phase 0 auto-nav at bottom")
+                        return HandlerResult(actions_log=log, success=True)
                 break
             prev_scroll_y = cur_y
 
-        # Phase 0b: keyboard scroll
-        page.evaluate("window.scrollTo(0, 0)")
-        time.sleep(0.1)
-        page.keyboard.press("End")
-        time.sleep(0.5)
+        # Try accumulated codes from Phase 0
+        p0_new = [c for c in phase0_codes if c not in FALSE_POSITIVES
+                  and c not in _LATIN_FP and not c.isdigit()
+                  and c not in (known_codes or [])
+                  and not re.match(r'^\d+(?:PX|VH|VW|EM|REM|MS|FR)$', c)]
+        if p0_new:
+            logger.info("Scroll phase 0 accumulated codes: %s", p0_new[:10])
+            for code in sort_codes_by_priority(p0_new)[:5]:
+                ok, _ = fill_and_submit(page, code, step_number)
+                if ok:
+                    return HandlerResult(actions_log=log, success=True, codes_found=[code])
 
-        for _ in range(80):
-            page.keyboard.press("PageDown")
-            time.sleep(0.06)
+        # Phase 0-deep: React + CSS + shadow DOM extraction
+        if not _expired():
+            deep_codes = deep_code_extraction(page, set(known_codes or []))
+            if deep_codes:
+                logger.info("Scroll phase 0-deep: %s", deep_codes[:8])
+                for code in deep_codes[:10]:
+                    ok, _ = fill_and_submit(page, code, step_number)
+                    if ok:
+                        return HandlerResult(actions_log=log, success=True, codes_found=[code])
+
+        # Phase 0-slow: incremental scroll with pauses
+        if not _expired():
+            if sorted_codes:
+                _fill_code_in_input(page, sorted_codes[0])
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.2)
+            total_h = page.evaluate("() => document.body.scrollHeight")
+            slow_start = time.time()
+            prev_y = 0
+            for pos in range(0, total_h + 400, 400):
+                if time.time() - slow_start > 8 or _expired():
+                    break
+                page.mouse.wheel(0, 400)
+                time.sleep(0.25)
+                if _progress():
+                    log.append("scroll: phase 0-slow auto-nav")
+                    return HandlerResult(actions_log=log, success=True)
+                cur_y = page.evaluate("() => window.scrollY")
+                if cur_y <= prev_y and prev_y > 100:
+                    break
+                prev_y = cur_y
+
+        # Phase 0a: scrollable containers
+        if not _expired():
+            containers = page.evaluate("""\
+(() => {
+    const results = [];
+    const els = document.querySelectorAll('div, section, main, article');
+    for (const el of els) {
+        if (el.closest('.fixed')) continue;
+        const s = window.getComputedStyle(el);
+        const overflow = s.overflow + s.overflowY;
+        if (!(overflow.includes('auto') || overflow.includes('scroll'))) continue;
+        if (el.scrollHeight <= el.clientHeight + 10) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 100 || r.height < 100) continue;
+        results.push({
+            x: Math.round(r.x + r.width/2),
+            y: Math.round(r.y + r.height/2),
+            scrollable: el.scrollHeight - el.clientHeight
+        });
+    }
+    return results;
+})()""")
+            for cont in (containers or [])[:3]:
+                page.mouse.move(cont['x'], cont['y'])
+                time.sleep(0.05)
+                scroll_remaining = cont['scrollable']
+                while scroll_remaining > 0:
+                    page.mouse.wheel(0, 500)
+                    scroll_remaining -= 500
+                    time.sleep(0.10)
+                    if _progress():
+                        log.append("scroll: container scroll worked")
+                        return HandlerResult(actions_log=log, success=True)
+
+        # Phase 0b: keyboard scroll
+        if not _expired():
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.1)
+            page.keyboard.press("End")
+            time.sleep(0.5)
+            if _progress():
+                log.append("scroll: End key worked")
+                return HandlerResult(actions_log=log, success=True)
+            for _ in range(80):
+                if _expired():
+                    break
+                page.keyboard.press("PageDown")
+                time.sleep(0.06)
+                if _progress():
+                    log.append("scroll: PageDown worked")
+                    return HandlerResult(actions_log=log, success=True)
 
         # Phase 0c: synthetic events
-        page.evaluate("""\
+        if not _expired():
+            page.evaluate("""\
 (() => {
     window.scrollTo(0, document.body.scrollHeight);
     for (const target of [window, document, document.documentElement, document.body]) {
@@ -1295,14 +1408,20 @@ class ChallengeHandlers:
         target.dispatchEvent(new WheelEvent('wheel', {deltaY: 500, bubbles: true}));
     }
 })()""")
-        time.sleep(0.3)
+            time.sleep(0.3)
+            if _progress():
+                log.append("scroll: synthetic events worked")
+                return HandlerResult(actions_log=log, success=True)
 
-        # Phase 1: scroll + click safe buttons
-        total_h = page.evaluate("() => document.body.scrollHeight")
-        for pos in range(0, total_h + 800, 800):
-            page.evaluate(f"window.scrollTo(0, {pos})")
-            time.sleep(0.05)
-            btn_results = page.evaluate("""\
+        # Phase 1: scroll + click safe buttons with progress checks
+        if not _expired():
+            total_h = page.evaluate("() => document.body.scrollHeight")
+            for pos in range(0, total_h + 800, 800):
+                if _expired():
+                    break
+                page.evaluate(f"window.scrollTo(0, {pos})")
+                time.sleep(0.05)
+                btn_results = page.evaluate("""\
 (() => {
     const SAFE_WORDS = ['next', 'submit', 'go', '\u2192', 'navigate', 'enter'];
     const btns = [...document.querySelectorAll('button, a')];
@@ -1322,13 +1441,17 @@ class ChallengeHandlers:
     }
     return results;
 })()""")
-            for btn in btn_results:
-                clear_popups(page)
-                page.evaluate(f"(idx) => [...document.querySelectorAll('button, a')][idx]?.click()", btn["idx"])
-                time.sleep(0.1)
+                for btn in btn_results:
+                    clear_popups(page)
+                    page.evaluate(f"(idx) => [...document.querySelectorAll('button, a')][idx]?.click()", btn["idx"])
+                    time.sleep(0.1)
+                    if _progress():
+                        log.append(f"scroll: safe button '{btn['text']}' worked")
+                        return HandlerResult(actions_log=log, success=True)
 
         # Phase 2: outlier buttons
-        outlier_result = page.evaluate("""\
+        if not _expired():
+            outlier_result = page.evaluate("""\
 (() => {
     const btns = [...document.querySelectorAll('button')].filter(b => {
         if (!b.offsetParent || b.disabled || b.closest('.fixed')) return false;
@@ -1341,27 +1464,31 @@ class ChallengeHandlers:
     const outliers = btns.filter(b => { const label = b.textContent.trim().toLowerCase(); return freq[label] <= 2; });
     return outliers.map((b, i) => ({text: b.textContent.trim(), idx: [...document.querySelectorAll('button')].indexOf(b)}));
 })()""")
-        if outlier_result:
-            for btn in outlier_result:
-                clear_popups(page)
-                page.evaluate(f"""\
+            if outlier_result:
+                for btn in outlier_result:
+                    clear_popups(page)
+                    page.evaluate(f"""\
 (idx) => {{
     const btn = document.querySelectorAll('button')[idx];
     if (btn) {{ btn.scrollIntoView({{behavior: 'instant', block: 'center'}}); btn.click(); }}
 }}""", btn["idx"])
-                time.sleep(0.12)
+                    time.sleep(0.12)
+                    if _progress():
+                        log.append(f"scroll: outlier '{btn['text']}' worked")
+                        return HandlerResult(actions_log=log, success=True)
 
         # Phase 3: full page button scan
-        if sorted_codes:
-            _fill_code_in_input(page, sorted_codes[0])
-        page.evaluate("window.scrollTo(0, 0)")
-        time.sleep(0.05)
-        total_h = page.evaluate("() => document.body.scrollHeight")
-        for pos in range(0, total_h + 1000, 1000):
-            page.mouse.wheel(0, 1000)
+        if not _expired():
+            if sorted_codes:
+                _fill_code_in_input(page, sorted_codes[0])
+            page.evaluate("window.scrollTo(0, 0)")
             time.sleep(0.05)
+            total_h = page.evaluate("() => document.body.scrollHeight")
+            for pos in range(0, total_h + 1000, 1000):
+                page.mouse.wheel(0, 1000)
+                time.sleep(0.05)
 
-        all_btns = page.evaluate("""\
+            all_btns = page.evaluate("""\
 (() => {
     const btns = [...document.querySelectorAll('button, a')].filter(el => {
         if (el.disabled || el.closest('.fixed')) return false;
@@ -1370,12 +1497,14 @@ class ChallengeHandlers:
     });
     return btns.map((b, i) => ({text: b.textContent.trim(), idx: i}));
 })()""")
-        batch_size = 5
-        for start in range(0, len(all_btns), batch_size):
-            end = min(start + batch_size, len(all_btns))
-            page.evaluate(f"""\
+            batch_size = 5
+            for start_idx in range(0, len(all_btns), batch_size):
+                if _expired():
+                    break
+                end_idx = min(start_idx + batch_size, len(all_btns))
+                page.evaluate(f"""\
 (() => {{
-    const start = {start}, end = {end};
+    const start = {start_idx}, end = {end_idx};
     const clearP = () => {{
         document.querySelectorAll('.fixed').forEach(el => {{
             const text = el.textContent || '';
@@ -1401,10 +1530,99 @@ class ChallengeHandlers:
         allBtns[i].click();
     }}
 }})()""")
+                time.sleep(0.1)
+                if _progress():
+                    log.append("scroll: phase 3 batch worked")
+                    return HandlerResult(actions_log=log, success=True)
+
+        # Phase 4: Playwright mouse click through visible buttons during scroll
+        if not _expired():
+            if sorted_codes:
+                _fill_code_in_input(page, sorted_codes[0])
+            page.evaluate("window.scrollTo(0, 0)")
             time.sleep(0.1)
+            total_h = page.evaluate("() => document.body.scrollHeight")
+            scroll_pos = 0
+            phase4_start = time.time()
+            while scroll_pos < total_h + 800:
+                if time.time() - phase4_start > 12 or _expired():
+                    break
+                page.mouse.wheel(0, 800)
+                scroll_pos += 800
+                time.sleep(0.1)
+                visible_btns = page.evaluate("""\
+(() => {
+    const sel = 'button, a, [role="button"], [class*="cursor-pointer"], [onclick]';
+    const els = [...document.querySelectorAll(sel)].filter(el => {
+        if (el.closest('.fixed') || el.disabled) return false;
+        const rect = el.getBoundingClientRect();
+        if (rect.top < -10 || rect.top > window.innerHeight + 10) return false;
+        if (rect.width < 10 || rect.height < 10) return false;
+        const t = (el.textContent || '').trim();
+        if (t.length === 0 || t.length > 60) return false;
+        if (t === '\u00d7' || t === 'X' || t === '\u2715') return false;
+        return true;
+    });
+    return els.map(el => {
+        const rect = el.getBoundingClientRect();
+        return { text: (el.textContent || '').trim().substring(0, 40),
+                 x: Math.round(rect.x + rect.width / 2),
+                 y: Math.round(rect.y + rect.height / 2) };
+    });
+})()""")
+                for btn in (visible_btns or []):
+                    clear_popups(page)
+                    try:
+                        page.mouse.click(btn['x'], btn['y'])
+                        time.sleep(0.05)
+                    except Exception:
+                        pass
+                if _progress():
+                    log.append(f"scroll: phase 4 worked at scroll {scroll_pos}px")
+                    return HandlerResult(actions_log=log, success=True)
+
+        # Phase 5: React onClick elements (divs, spans that aren't buttons)
+        if not _expired():
+            page.evaluate("window.scrollTo(0, 0)")
+            time.sleep(0.05)
+            total_h = page.evaluate("() => document.body.scrollHeight")
+            for scroll_pos in range(0, total_h + 1200, 1200):
+                if _expired():
+                    break
+                page.mouse.wheel(0, 1200)
+                time.sleep(0.08)
+                react_btns = page.evaluate("""\
+(() => {
+    const results = [];
+    const els = document.querySelectorAll('div, span, p, li, td, section');
+    for (const el of els) {
+        if (el.closest('.fixed')) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.top < -10 || rect.top > window.innerHeight + 10) continue;
+        if (rect.width < 20 || rect.height < 15) continue;
+        const propsKey = Object.keys(el).find(k => k.startsWith('__reactProps$'));
+        if (propsKey && el[propsKey] && el[propsKey].onClick) {
+            const t = (el.textContent || '').trim();
+            if (t === '\u00d7' || t === 'X' || t.length > 60) continue;
+            if (el.querySelector('button, a')) continue;
+            results.push({ x: Math.round(rect.x + rect.width / 2),
+                           y: Math.round(rect.y + rect.height / 2) });
+        }
+    }
+    return results;
+})()""")
+                for btn in (react_btns or []):
+                    clear_popups(page)
+                    try:
+                        page.mouse.click(btn['x'], btn['y'])
+                    except Exception:
+                        pass
+                if _progress():
+                    log.append("scroll: React onClick worked")
+                    return HandlerResult(actions_log=log, success=True)
 
         page.evaluate("window.scrollTo(0, 0)")
-        log.append("scroll: all phases complete")
+        log.append("scroll: all phases complete, no progress")
         return HandlerResult(actions_log=log, needs_extraction=True)
 
     def handle_hover_reveal(self, page) -> HandlerResult:

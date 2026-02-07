@@ -39,7 +39,7 @@ class SolveResult:
 class DeterministicSolver:
     """Deterministic solver — no LLM calls, pure heuristics + Playwright."""
 
-    def __init__(self, max_attempts: int = 15, step_timeout: float = 25.0):
+    def __init__(self, max_attempts: int = 15, step_timeout: float = 45.0):
         self.max_attempts = max_attempts
         self.step_timeout = step_timeout
         self.detector = ChallengeDetector()
@@ -153,6 +153,9 @@ class DeterministicSolver:
                 # Keyboard sequence
                 if "keyboard sequence" in html_lower or ("press" in html_lower and "keys" in html_lower):
                     self.handlers.handle_keyboard_sequence(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Math puzzle
                 if "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
@@ -185,10 +188,16 @@ class DeterministicSolver:
                 # Timing capture
                 if "capture" in html_lower and ("timing" in html_lower or "second" in html_lower):
                     self.handlers.handle_timing_capture(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Hover reveal
                 if "hover" in html_lower and ("reveal" in html_lower or "code" in html_lower):
                     self.handlers.handle_hover_reveal(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # "I Remember" buttons
                 page.evaluate("""\
@@ -198,15 +207,24 @@ class DeterministicSolver:
         if (t.includes('i remember') && btn.offsetParent && !btn.disabled) btn.click();
     });
 })()""")
+                if check_progress(page.url, step_number):
+                    result.success = True
+                    break
 
                 # Audio
                 if "audio" in html_lower and ("play" in html_lower or "listen" in html_lower):
                     self.handlers.handle_audio(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Canvas
                 has_canvas = page.evaluate("() => !!document.querySelector('canvas')")
                 if has_canvas and ("draw" in html_lower or "canvas" in html_lower or "stroke" in html_lower):
                     self.handlers.handle_canvas_draw(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Service Worker
                 if "service worker" in html_lower or ("register" in html_lower and "cache" in html_lower):
@@ -318,22 +336,37 @@ class DeterministicSolver:
                 # Split parts
                 if "part" in html_lower and ("found" in html_lower or "collect" in html_lower):
                     self.handlers.handle_split_parts(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Rotating code
                 if "rotat" in html_lower and "capture" in html_lower:
                     self.handlers.handle_rotating_code(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Multi-tab
                 if "tab" in html_lower and ("click" in html_lower or "visit" in html_lower):
                     self.handlers.handle_multi_tab(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Sequence
                 if "sequence" in html_lower or ("click" in html_lower and "hover" in html_lower and "type" in html_lower):
                     self.handlers.handle_sequence(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Video frames
                 if "frame" in html_lower and ("navigate" in html_lower or "+1" in html_text or "-1" in html_text):
                     self.handlers.handle_video_frames(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Deep code extraction
                 deep_codes = deep_code_extraction(page, set(failed_codes))
@@ -399,8 +432,8 @@ class DeterministicSolver:
 })()""")
                 if is_scroll_challenge and not scroll_attempted:
                     scroll_attempted = True
-                    self.handlers.handle_scroll_to_find(page, failed_codes)
-                    if check_progress(page.url, step_number):
+                    hr = self.handlers.handle_scroll_to_find(page, failed_codes, step_number)
+                    if hr.success or check_progress(page.url, step_number):
                         result.success = True
                         break
 
@@ -444,6 +477,22 @@ class DeterministicSolver:
     });
 })()""")
                 time.sleep(0.3)
+                if check_progress(page.url, step_number):
+                    result.success = True
+                    break
+
+                # Playwright mouse drag-and-drop fallback
+                fill_count = page.evaluate("""\
+(() => {
+    const text = document.body.textContent || '';
+    const match = text.match(/(\\d+)\\/(\\d+)\\s*filled/);
+    return match ? parseInt(match[1]) : -1;
+})()""")
+                if fill_count >= 0 and fill_count < 6:
+                    self.handlers.handle_drag_and_drop(page)
+                    if check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
                 # Re-extract after all fast-path actions
                 html = page.content()
@@ -477,44 +526,26 @@ class DeterministicSolver:
 })()""")
                     if trap_count >= 8 and not scroll_attempted:
                         scroll_attempted = True
-                        self.handlers.handle_scroll_to_find(page, failed_codes)
-                        if check_progress(page.url, step_number):
+                        hr = self.handlers.handle_scroll_to_find(page, failed_codes, step_number)
+                        if hr.success or check_progress(page.url, step_number):
                             result.success = True
                             break
 
                 result.actions_log.append(f"fast_path attempt 0 done")
                 continue
 
-            # 4. Detection-based handling for subsequent attempts
-            detections = self.detector.detect(page)
-            if detections:
-                # Skip handler types that already returned no codes
-                best = None
-                for det in detections:
-                    if det.challenge_type.name not in failed_handler_types:
-                        best = det
-                        break
-                if best is None:
-                    best = detections[0]  # All handlers failed — retry best
+            # 4. Re-run text-based handler dispatch for subsequent attempts
+            #    (like the reference: try all matching handlers, not just the "best" detected type)
+            html_text = page.evaluate("() => document.body.textContent || ''")
+            html_lower = html_text.lower()
 
-                result.challenge_type = best.challenge_type
-                logger.info("Step %d attempt %d: detected %s (%.2f)",
-                            step_number, attempt, best.challenge_type.name, best.confidence)
+            # Clear popups before retry
+            clear_popups(page)
 
-                hr = self.handlers.handle(page, best.challenge_type, step_number, failed_codes)
-                result.actions_log.extend(hr.actions_log)
-
-                # Track handlers that returned no usable codes
-                if not hr.success and not hr.codes_found:
-                    failed_handler_types.add(best.challenge_type.name)
-
-                if hr.success:
-                    result.success = True
-                    if hr.codes_found:
-                        result.code_found = hr.codes_found[0]
-                    break
-
-                # Try codes from handler
+            # Re-try handlers based on text signals (same as fast path but for attempt > 0)
+            # Shadow DOM
+            if "shadow" in html_lower and ("layer" in html_lower or "level" in html_lower or "nested" in html_lower):
+                hr = self.handlers.handle_shadow_dom(page)
                 for code in hr.codes_found:
                     if code in failed_codes:
                         continue
@@ -526,6 +557,109 @@ class DeterministicSolver:
                     failed_codes.append(code)
                 if result.success:
                     break
+
+            # WebSocket
+            if "websocket" in html_lower or ("connect" in html_lower and "server" in html_lower):
+                hr = self.handlers.handle_websocket(page)
+                for code in hr.codes_found:
+                    if code in failed_codes:
+                        continue
+                    ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = code
+                        break
+                    failed_codes.append(code)
+                if result.success:
+                    break
+
+            # Mutation
+            if "mutation" in html_lower:
+                hr = self.handlers.handle_mutation(page)
+                for code in hr.codes_found:
+                    if code in failed_codes:
+                        continue
+                    ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = code
+                        break
+                    failed_codes.append(code)
+                if result.success:
+                    break
+
+            # Iframe
+            if "iframe" in html_lower and ("level" in html_lower or "nested" in html_lower or "depth" in html_lower):
+                hr = self.handlers.handle_iframe(page)
+                for code in hr.codes_found:
+                    if code in failed_codes:
+                        continue
+                    ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = code
+                        break
+                    failed_codes.append(code)
+                if result.success:
+                    break
+
+            # Delayed reveal
+            if "delayed" in html_lower and ("reveal" in html_lower or "remaining" in html_lower or "wait" in html_lower):
+                hr = self.handlers.handle_delayed_reveal(page)
+                for code in hr.codes_found:
+                    if code in failed_codes:
+                        continue
+                    ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = code
+                        break
+                    failed_codes.append(code)
+                if result.success:
+                    break
+
+            # Audio
+            if "audio" in html_lower and "play" in html_lower:
+                self.handlers.handle_audio(page)
+                if check_progress(page.url, step_number):
+                    result.success = True
+                    break
+
+            # Canvas
+            has_canvas = page.evaluate("() => !!document.querySelector('canvas')")
+            if has_canvas:
+                self.handlers.handle_canvas_draw(page)
+                if check_progress(page.url, step_number):
+                    result.success = True
+                    break
+
+            # Scroll-to-find retry
+            if not scroll_attempted:
+                is_scroll = page.evaluate("""\
+(() => {
+    const bodyText = (document.body.textContent || '').toLowerCase();
+    if (!!document.querySelector('canvas') || bodyText.includes('audio challenge') ||
+        document.querySelectorAll('[draggable="true"]').length >= 3) return false;
+    const els = document.querySelectorAll('h1, h2, h3, .text-2xl, .text-3xl, .text-xl, .font-bold, .text-lg');
+    for (const el of els) {
+        const t = (el.textContent || '').toLowerCase();
+        if (t.includes('scroll down to find') || t.includes('scroll to find')) return true;
+    }
+    if (document.body.scrollHeight > 5000) {
+        const sectionDivs = [...document.querySelectorAll('div')].filter(el => {
+            const t = (el.textContent || '').trim();
+            return t.match(/^Section \\d+/) && t.length > 50;
+        });
+        if (sectionDivs.length > 10) return true;
+    }
+    return false;
+})()""")
+                if is_scroll:
+                    scroll_attempted = True
+                    hr = self.handlers.handle_scroll_to_find(page, failed_codes, step_number)
+                    if hr.success or check_progress(page.url, step_number):
+                        result.success = True
+                        break
 
             # 5. Re-extract after handler actions
             html = page.content()
