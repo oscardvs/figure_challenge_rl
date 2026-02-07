@@ -13,6 +13,8 @@ __pycache__/
 *.pyd
 .Python
 *.so
+data/expert_preferences_pairs/
+data/expert_trajectories/
 
 # IDE
 .idea/
@@ -29,3 +31,6 @@ agent_*.json
 .venv/
 __pycache__/
 *.pyc
+
+data/*
+/data/expert_*/
