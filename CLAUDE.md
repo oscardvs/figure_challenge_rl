@@ -30,8 +30,16 @@ scripts/       — debug_run.py, explore_challenges.py
 
 ## Important Patterns & Gotchas
 
-### SPA Content Wait + Reload Fallback
-The React SPA frequently fails to re-mount into `<div id="root">` after client-side route changes (BrowserGym's DOM instrumentation breaks React's virtual DOM reconciliation). `_wait_for_content()` polls `#root.children.length > 0` for 5s. **If React doesn't mount, it reloads the page** (`page.reload(wait_until="networkidle")`) to force fresh hydration, then waits again. This is critical — without the reload, step 2+ observations are always empty (194 chars). Both `reset()` and `step()` call this on transitions, then re-extract obs via `_env._get_obs()`. The `__bgym_js_result` div is also cleaned up on step transitions to avoid polluting the next step.
+### Step Transition: Mandatory Reload Pattern
+BrowserGym's `set_of_marks` injects `bid`/`browsergym_visibility_ratio` attributes into ALL DOM elements during `_get_obs()`. This crashes React's virtual DOM reconciliation. On **initial page load** (step 1 or after `page.reload()`), React fully hydrates before `_get_obs()` runs, so the AXTree is captured with full content (~2000+ chars). But after **SPA navigation** (step transitions), React is still rendering when `_get_obs()` fires `set_of_marks`, causing React to abort mid-render → sparse obs (~618 chars with only header elements).
+
+**Fix**: `_wait_and_refresh_obs()` always calls `page.reload(wait_until="networkidle")` on step transitions to force fresh React hydration (like initial load). It then calls `_wait_for_content()` → `_dismiss_overlays()` → `_get_obs()`. If the resulting obs_text is still < 1000 chars, it retries up to 2 more times.
+
+**Critical**: Use `len(obs_text) >= 1000` to check obs quality, NOT `len(axtree.children) >= 3`. Header elements like "Step 2 of 30" survive React crashes and satisfy the children count, but puzzle content is missing. The obs_text length after pruning is the reliable signal.
+
+The `__bgym_js_result` div is cleaned up on step transitions to prevent result accumulation ("JS Result: JS Result: ...").
+
+`_wait_for_content()` uses `page.wait_for_selector("#root > *")` with a reload fallback if React doesn't mount within 5s.
 
 ### Action Parser
 `_ACTION_PATTERN` in `prompts.py` must include ALL valid BrowserGym actions. If a new action is added to the action set, it MUST be added to this regex or it will silently become `noop()`.
