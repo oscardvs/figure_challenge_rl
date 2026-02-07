@@ -25,7 +25,7 @@ sft:
   per_device_batch_size: 2
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
-  num_epochs: 3
+  num_epochs: 5          # Increased from 3 — small dataset needs more passes
   warmup_ratio: 0.1
   optimizer: "adamw_8bit"
   bf16: true
@@ -33,22 +33,22 @@ sft:
 
 # DPO training
 dpo:
-  beta: 0.1
+  beta: 0.05             # Reduced from 0.1 — less aggressive KL penalty for RL agents
   learning_rate: 5.0e-6
   per_device_batch_size: 2
   gradient_accumulation_steps: 4
   max_seq_length: 2048
-  num_epochs: 1
+  num_epochs: 2          # Increased from 1 — single epoch is too few for small data
   ref_model: null  # adapter-as-reference
 
 # M-GRPO training
 grpo:
   kl_coefficient: 0.001
   clip_epsilon: 0.2
-  group_size: 4
+  group_size: 8          # Increased from 4 — more stable advantage estimation
   max_context_length: 8192
   max_new_tokens: 512
-  sampling_temperature: 1.0
+  sampling_temperature: 0.8  # Reduced from 1.0 — less entropy for more focused exploration
   rollout_episodes: 500
   rollout_mode: "gauntlet"     # "gauntlet" (GauntletEnv, randomized) or "step" (StepEnv, fixed)
   curriculum_max_steps: 5      # Start with first N steps, expand as success rate improves

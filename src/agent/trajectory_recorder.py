@@ -360,11 +360,12 @@ class RecordingPage:
         """Get the BrowserGym bid of the currently focused element."""
         try:
             bid = self._page.evaluate(
-                "() => document.activeElement?.getAttribute('bid') || '0'"
+                "() => document.activeElement?.getAttribute('bid') || ''"
             )
-            return str(bid)
+            return str(bid) if bid else ""
         except Exception:
-            return "0"
+            logger.debug("Could not get focused element bid")
+            return ""
 
     def _capture_obs(self) -> str:
         """Capture current observation, throttled by obs_interval.

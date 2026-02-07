@@ -200,11 +200,8 @@ class MCTSSearch:
         while (
             not current_node.is_leaf
             and current_node.children
-            and not current_node.is_fully_expanded is False  # has children
+            and current_node.is_fully_expanded
         ):
-            # If node has unexpanded actions, stop here for expansion.
-            if not current_node.is_fully_expanded:
-                break
             action_str = self._ucb1_select(current_node)
             if action_str is None or action_str not in current_node.children:
                 break

@@ -14,10 +14,12 @@ We provide two environment modes:
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import yaml
 from browsergym.core.env import BrowserEnv
@@ -61,6 +63,26 @@ _DISMISS_OVERLAYS_JS = """\
 """
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "config" / "challenge_config.yaml"
+
+
+def _get_playwright_proxy() -> dict | None:
+    """Build Playwright proxy config from environment variables if present.
+
+    Supports standard HTTP_PROXY / HTTPS_PROXY with user:password auth.
+    Returns None if no proxy is configured.
+    """
+    proxy_url = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or ""
+    if not proxy_url:
+        return None
+    parsed = urlparse(proxy_url)
+    if not parsed.hostname:
+        return None
+    proxy: dict = {"server": f"http://{parsed.hostname}:{parsed.port}"}
+    if parsed.username:
+        proxy["username"] = parsed.username
+    if parsed.password:
+        proxy["password"] = parsed.password
+    return proxy
 
 
 def _load_config() -> dict:
@@ -497,6 +519,12 @@ class GauntletEnv:
             with_long_description=True, with_examples=True,
         )
 
+        pw_kwargs: dict = {}
+        proxy = _get_playwright_proxy()
+        if proxy:
+            pw_kwargs["proxy"] = proxy
+            logger.info("Using HTTP proxy for browser: %s", proxy["server"])
+
         self._env = BrowserEnv(
             task_entrypoint=GauntletTask,
             task_kwargs={
@@ -508,6 +536,7 @@ class GauntletEnv:
             headless=headless,
             action_mapping=action_set.to_python_code,
             record_video_dir=record_video_dir,
+            pw_chromium_kwargs=pw_kwargs,
         )
 
     def _dismiss_overlays(self):
@@ -611,6 +640,12 @@ class StepEnv:
             with_long_description=True, with_examples=True,
         )
 
+        pw_kwargs: dict = {}
+        proxy = _get_playwright_proxy()
+        if proxy:
+            pw_kwargs["proxy"] = proxy
+            logger.info("Using HTTP proxy for browser: %s", proxy["server"])
+
         self._env = BrowserEnv(
             task_entrypoint=StepTask,
             task_kwargs={
@@ -623,6 +658,7 @@ class StepEnv:
             headless=headless,
             action_mapping=action_set.to_python_code,
             record_video_dir=record_video_dir,
+            pw_chromium_kwargs=pw_kwargs,
         )
 
     def _dismiss_overlays(self):

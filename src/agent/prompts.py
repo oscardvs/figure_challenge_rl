@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import re
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """\
 You are an autonomous browser agent solving a 30-step web navigation gauntlet. \
@@ -165,4 +168,5 @@ def parse_action_from_response(response: str) -> str:
             return line
 
     # 3. No valid action found — return noop to avoid sending garbage.
+    logger.warning("No valid action found in LLM response (len=%d): %.200s", len(response), response)
     return 'noop()'
