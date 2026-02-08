@@ -26,7 +26,7 @@ from browsergym.core.env import BrowserEnv
 from browsergym.core.task import AbstractBrowserTask
 
 from src.environment.action_space import get_action_set
-from src.environment.observation import AXTreePruner, extract_obs_text
+from src.environment.observation import AXTreePruner, extract_html_snippet, extract_obs_text
 
 logger = logging.getLogger(__name__)
 
@@ -201,13 +201,12 @@ def _get_reliable_obs(env, page, pruner, max_retries: int = 3) -> str:
     extracts the accessibility snapshot. Retry with increasing delays to
     give React time to settle.
     """
-    from src.environment.observation import extract_obs_text
-
     for attempt in range(max_retries):
         if attempt > 0:
             time.sleep(0.5 * (attempt + 1))  # 1s, 1.5s
         obs = env._get_obs()
-        obs_text = extract_obs_text(obs, pruner)
+        html = extract_html_snippet(page)
+        obs_text = extract_obs_text(obs, pruner, html_snippet=html)
         if _is_obs_valid(obs_text):
             return obs_text
 
@@ -564,7 +563,8 @@ class GauntletEnv:
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
         self._dismiss_overlays()
-        obs_text = extract_obs_text(obs, self.pruner)
+        html = extract_html_snippet(self._env.page)
+        obs_text = extract_obs_text(obs, self.pruner, html_snippet=html)
 
         task_info = info.get("task_info", info)
         self._prev_step = task_info.get("current_step", 1)
@@ -686,7 +686,8 @@ class StepEnv:
     def reset(self, seed: int | None = None) -> tuple[str, dict]:
         obs, info = self._env.reset(seed=seed)
         self._dismiss_overlays()
-        obs_text = extract_obs_text(obs, self.pruner)
+        html = extract_html_snippet(self._env.page)
+        obs_text = extract_obs_text(obs, self.pruner, html_snippet=html)
         return obs_text, info
 
     def step(self, action: str) -> tuple[str, float, bool, bool, dict]:

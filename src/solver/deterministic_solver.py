@@ -18,12 +18,15 @@ from dataclasses import dataclass, field
 from src.solver.challenge_detector import ChallengeDetector, ChallengeType
 from src.solver.challenge_handlers import (
     ChallengeHandlers,
-    FALSE_POSITIVES,
+    _hide_stuck_modals,
+    _try_trap_buttons,
     check_progress,
     clear_popups,
     deep_code_extraction,
     extract_hidden_codes,
     fill_and_submit,
+    force_reset_puzzle,
+    is_false_positive,
     sort_codes_by_priority,
 )
 
@@ -52,7 +55,7 @@ class DeterministicSolver:
     def __init__(
         self,
         max_attempts: int = 15,
-        step_timeout: float = 45.0,
+        step_timeout: float = 90.0,
         use_vision: bool | None = None,
     ):
         self.max_attempts = max_attempts
@@ -180,6 +183,24 @@ class DeterministicSolver:
         # Wait for React SPA to render meaningful content
         _wait_for_page_ready(page)
 
+        # Diagnostic: log page content summary
+        try:
+            diag = page.evaluate("""\
+(() => {
+    const text = (document.body.textContent || '').substring(0, 300);
+    const btns = [...document.querySelectorAll('button')].filter(b => b.offsetParent).length;
+    const inputs = [...document.querySelectorAll('input')].filter(i => i.offsetParent).length;
+    const canvas = !!document.querySelector('canvas');
+    const height = document.body.scrollHeight;
+    return {text, btns, inputs, canvas, height};
+})()""")
+            logger.info("Step %d page: btns=%d inputs=%d canvas=%s height=%d text=%s",
+                        step_number, diag.get("btns", 0), diag.get("inputs", 0),
+                        diag.get("canvas", False), diag.get("height", 0),
+                        repr(diag.get("text", "")[:150]))
+        except Exception:
+            pass
+
         for attempt in range(self.max_attempts):
             elapsed = time.time() - t0
             if elapsed > self.step_timeout:
@@ -255,6 +276,7 @@ class DeterministicSolver:
                             result.success = True
                             result.code_found = code
                             break
+                        logger.debug("Step %d: DOM code '%s' failed (trap=%s)", step_number, code, submit_is_trap)
                         failed_codes.append(code)
                     if result.success:
                         break
@@ -279,13 +301,19 @@ class DeterministicSolver:
                 # Math puzzle (skip if already solved on a previous iteration)
                 if not math_solved and "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
                     math_solved = True
-                    hr = self.handlers.handle_math_puzzle(page, failed_codes)
+                    hr = self.handlers.handle_math_puzzle(page, failed_codes, stale_codes)
                     all_math_codes = list(hr.codes_found)
+                    logger.info("Step %d: math handler codes: %s, log: %s",
+                                step_number, all_math_codes, hr.actions_log)
                     # Also do post-math deep extraction
                     post_math = deep_code_extraction(page, set(failed_codes))
                     for c in post_math[:5]:
                         if c not in all_math_codes:
                             all_math_codes.append(c)
+                    if all_math_codes:
+                        logger.info("Step %d: all math+deep codes: %s", step_number, all_math_codes[:8])
+                    else:
+                        logger.warning("Step %d: math puzzle solved but NO codes found!", step_number)
                     for code in all_math_codes:
                         if code in failed_codes:
                             continue
@@ -303,6 +331,18 @@ class DeterministicSolver:
                         failed_codes.append(code)
                     if result.success:
                         break
+
+                    # Force-reset puzzle if showing stale "already solved" state
+                    if "solved" in html_lower and "code revealed" in html_lower:
+                        fresh_code = force_reset_puzzle(page, failed_codes)
+                        if fresh_code and fresh_code not in failed_codes:
+                            logger.info("Step %d: force-reset puzzle code: %s", step_number, fresh_code)
+                            ok, submit_is_trap = fill_and_submit(page, fresh_code, step_number, submit_is_trap)
+                            if ok:
+                                result.success = True
+                                result.code_found = fresh_code
+                                break
+                            failed_codes.append(fresh_code)
 
                 # Timing capture
                 if "capture" in html_lower and ("timing" in html_lower or "second" in html_lower):
@@ -338,9 +378,34 @@ class DeterministicSolver:
                         break
                     # Audio handler clicks Complete which reveals the code — extract and submit
                     time.sleep(0.5)
+                    # Try revealed code pattern first (most reliable after audio)
+                    revealed = page.evaluate("""\
+(() => {
+    const text = document.body.textContent || '';
+    const patterns = [
+        /(?:code|Code)[^:]*?:\\s*([A-Z0-9]{6})/,
+        /(?:revealed|unlocked|earned)[^.]*?\\b([A-Z0-9]{6})\\b/i,
+    ];
+    for (const p of patterns) { const m = text.match(p); if (m) return m[1].toUpperCase(); }
+    for (const el of document.querySelectorAll('.text-green-600, .text-green-500, .bg-green-100, .text-emerald-600')) {
+        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+        if (m) return m[1];
+    }
+    return null;
+})()""")
+                    if revealed and not is_false_positive(revealed) and revealed not in failed_codes:
+                        logger.info("Step %d: audio revealed code: %s", step_number, revealed)
+                        ok, submit_is_trap = fill_and_submit(page, revealed, step_number, submit_is_trap)
+                        if ok:
+                            result.success = True
+                            result.code_found = revealed
+                            break
+                        failed_codes.append(revealed)
                     audio_html = page.content()
                     audio_codes = extract_hidden_codes(audio_html)
                     audio_deep = deep_code_extraction(page, set(failed_codes))
+                    logger.info("Step %d: audio codes=%s deep=%s", step_number,
+                                audio_codes[:5] if audio_codes else [], audio_deep[:5] if audio_deep else [])
                     for code in list(audio_codes) + list(audio_deep):
                         if code in failed_codes:
                             continue
@@ -453,9 +518,17 @@ class DeterministicSolver:
                         break
 
                 # Iframe
-                if ("iframe" in html_lower and ("level" in html_lower or "nested" in html_lower or "depth" in html_lower or "recursive" in html_lower)) or \
-                   (challenge_buttons and (challenge_buttons.get("hasGoDeeper") or challenge_buttons.get("hasExtractCode"))):
+                _iframe_match = (
+                    ("iframe" in html_lower and ("level" in html_lower or "nested" in html_lower or "depth" in html_lower or "recursive" in html_lower))
+                    or ("recursive" in html_lower and ("level" in html_lower or "depth" in html_lower))
+                    or (challenge_buttons and (challenge_buttons.get("hasGoDeeper") or challenge_buttons.get("hasExtractCode")))
+                )
+                if _iframe_match:
+                    logger.info("Step %d: iframe match triggered (iframe=%s recursive=%s level=%s buttons=%s)",
+                                step_number, "iframe" in html_lower, "recursive" in html_lower,
+                                "level" in html_lower, challenge_buttons)
                     hr = self.handlers.handle_iframe(page)
+                    logger.info("Step %d: iframe handler result: codes=%s log=%s", step_number, hr.codes_found, hr.actions_log)
                     for code in hr.codes_found:
                         if code in failed_codes:
                             continue
@@ -464,6 +537,48 @@ class DeterministicSolver:
                             result.success = True
                             result.code_found = code
                             break
+                        # Code submission may have worked but a blocking modal
+                        # appeared (radio buttons, dismiss dialog) before URL changed.
+                        # Check for "Code accepted" text and handle blocking modals.
+                        page_text = page.evaluate("() => document.body.textContent || ''")
+                        if "Code accepted" in page_text or f"step {step_number + 1}" in page_text.lower():
+                            logger.info("Step %d: iframe code '%s' accepted but modal blocking — handling", step_number, code)
+                            # Dismiss success overlays
+                            page.evaluate("""() => {
+                                document.querySelectorAll('.fixed, [role="dialog"]').forEach(el => {
+                                    const t = el.textContent || '';
+                                    if (t.includes('Code accepted') || t.includes('Proceeding') || t.includes('Dismiss')) {
+                                        el.querySelectorAll('button').forEach(btn => {
+                                            const bt = (btn.textContent || '').trim().toLowerCase();
+                                            if (bt === 'dismiss' || bt === 'close' || bt === 'ok' || bt === 'continue') btn.click();
+                                        });
+                                    }
+                                });
+                            }""")
+                            time.sleep(0.5)
+                            # Handle any blocking radio modals
+                            radio_hr = self.handlers.handle_radio_brute_force(page, step_number)
+                            if radio_hr.success:
+                                logger.info("Step %d: radio modal resolved after iframe code", step_number)
+                            # Hide remaining modals
+                            _hide_stuck_modals(page)
+                            time.sleep(1.0)
+                            if check_progress(page.url, step_number):
+                                result.success = True
+                                result.code_found = code
+                                logger.info("Step %d: iframe code accepted after modal handling", step_number)
+                                break
+                            # DOM check as fallback
+                            dom_step = page.evaluate("""() => {
+                                const t = document.body.textContent || '';
+                                const m = t.match(/Step\\s+(\\d+)\\s+of\\s+30/);
+                                return m ? parseInt(m[1]) : 0;
+                            }""")
+                            if dom_step > step_number:
+                                result.success = True
+                                result.code_found = code
+                                logger.info("Step %d: iframe code accepted (DOM shows step %d)", step_number, dom_step)
+                                break
                         failed_codes.append(code)
                     if result.success:
                         break
@@ -521,6 +636,8 @@ class DeterministicSolver:
 
                 # Submit-is-trap: discover codes via scroll FIRST, then
                 # try all known codes with the animated button handler.
+                # Codes in failed_codes may be correct — they failed because
+                # of the trap button, not because the code was wrong.
                 if submit_is_trap:
                     time.sleep(0.5)
                     # Always try scroll handler when trap detected — the real
@@ -542,14 +659,38 @@ class DeterministicSolver:
                         if result.success:
                             break
 
-                    fresh_deep = deep_code_extraction(page, set(failed_codes))
+                    fresh_deep = deep_code_extraction(page, set())  # Don't exclude failed_codes — they may be correct
+                    # Also extract ALL visible 6-char codes from innerText
+                    all_visible = page.evaluate("""\
+(() => {
+    const text = document.body.innerText || '';
+    return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
+})()""") or []
+
+                    # Build list: fresh codes first, then failed_codes (which
+                    # may be correct codes that just hit the trap button)
+                    stale_set = set(stale_codes or []) if stale_codes else set()
                     all_to_try = list(dict.fromkeys(
-                        (fresh_deep or []) + (deep_codes or []) + list(codes or [])
+                        (fresh_deep or []) + all_visible + (deep_codes or []) + list(codes or []) + list(failed_codes)
                     ))
                     all_to_try = [c for c in all_to_try
-                                  if c not in failed_codes and re.fullmatch(r"[A-Z0-9]{6}", c)]
+                                  if c not in stale_set
+                                  and not is_false_positive(c)
+                                  and re.fullmatch(r"[A-Z0-9]{6}", c)]
+                    logger.info("Step %d: trap submit — trying %d codes with animated buttons",
+                                step_number, len(all_to_try[:10]))
                     for code in all_to_try[:10]:
                         if _try_animated_button_submit_with_check(page, code, step_number):
+                            result.success = True
+                            result.code_found = code
+                            break
+                    if result.success:
+                        break
+
+                    # Last resort: try trap-labeled buttons as real submits
+                    logger.info("Step %d: animated buttons failed — trying trap buttons as real submits", step_number)
+                    for code in all_to_try[:3]:
+                        if _try_trap_buttons(page, code, step_number):
                             result.success = True
                             result.code_found = code
                             break
@@ -561,7 +702,9 @@ class DeterministicSolver:
 (() => {
     const bodyText = (document.body.textContent || '').toLowerCase();
     const hasCanvas = !!document.querySelector('canvas');
-    const hasAudio = bodyText.includes('audio challenge') || (bodyText.includes('play audio') && bodyText.includes('complete'));
+    const hasAudio = bodyText.includes('audio challenge') || bodyText.includes('play audio')
+        || bodyText.includes('audio playback') || bodyText.includes('listen to')
+        || (bodyText.includes('audio') && (bodyText.includes('play') || bodyText.includes('listen')));
     const hasDrag = document.querySelectorAll('[draggable="true"]').length >= 3;
     if (hasCanvas || hasAudio || hasDrag) return false;
     const els = document.querySelectorAll('h1, h2, h3, .text-2xl, .text-3xl, .text-xl, .font-bold, .text-lg');
@@ -707,7 +850,7 @@ class DeterministicSolver:
             # Math puzzle (skip if already solved)
             if not math_solved and "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
                 math_solved = True
-                hr = self.handlers.handle_math_puzzle(page, failed_codes)
+                hr = self.handlers.handle_math_puzzle(page, failed_codes, stale_codes)
                 for code in hr.codes_found:
                     if code in failed_codes:
                         continue
@@ -724,6 +867,18 @@ class DeterministicSolver:
                     failed_codes.append(code)
                 if result.success:
                     break
+
+                # Force-reset puzzle if showing stale state (retry path)
+                if "solved" in html_lower and "code revealed" in html_lower:
+                    fresh_code = force_reset_puzzle(page, failed_codes)
+                    if fresh_code and fresh_code not in failed_codes:
+                        logger.info("Step %d: force-reset puzzle code (retry): %s", step_number, fresh_code)
+                        ok, submit_is_trap = fill_and_submit(page, fresh_code, step_number, submit_is_trap)
+                        if ok:
+                            result.success = True
+                            result.code_found = fresh_code
+                            break
+                        failed_codes.append(fresh_code)
 
             # Hover reveal
             if "hover" in html_lower and ("reveal" in html_lower or "code" in html_lower):
@@ -793,7 +948,8 @@ class DeterministicSolver:
                     break
 
             # Iframe
-            if "iframe" in html_lower and ("level" in html_lower or "nested" in html_lower or "depth" in html_lower):
+            if ("iframe" in html_lower and ("level" in html_lower or "nested" in html_lower or "depth" in html_lower or "recursive" in html_lower)) \
+               or ("recursive" in html_lower and ("level" in html_lower or "depth" in html_lower)):
                 hr = self.handlers.handle_iframe(page)
                 for code in hr.codes_found:
                     if code in failed_codes:
@@ -822,7 +978,7 @@ class DeterministicSolver:
                 if result.success:
                     break
 
-            # Audio
+            # Audio (retry)
             if "audio" in html_lower and "play" in html_lower:
                 self.handlers.handle_audio(page)
                 if check_progress(page.url, step_number):
@@ -830,6 +986,29 @@ class DeterministicSolver:
                     break
                 # Extract code revealed after clicking Complete
                 time.sleep(0.5)
+                # Try revealed code pattern first (most reliable)
+                revealed = page.evaluate("""\
+(() => {
+    const text = document.body.textContent || '';
+    const patterns = [
+        /(?:code|Code)[^:]*?:\\s*([A-Z0-9]{6})/,
+        /(?:revealed|unlocked|earned)[^.]*?\\b([A-Z0-9]{6})\\b/i,
+    ];
+    for (const p of patterns) { const m = text.match(p); if (m) return m[1].toUpperCase(); }
+    for (const el of document.querySelectorAll('.text-green-600, .text-green-500, .bg-green-100, .text-emerald-600')) {
+        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
+        if (m) return m[1];
+    }
+    return null;
+})()""")
+                if revealed and not is_false_positive(revealed) and revealed not in failed_codes:
+                    logger.info("Step %d: audio revealed code (retry): %s", step_number, revealed)
+                    ok, submit_is_trap = fill_and_submit(page, revealed, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = revealed
+                        break
+                    failed_codes.append(revealed)
                 audio_html = page.content()
                 audio_codes = extract_hidden_codes(audio_html)
                 audio_deep = deep_code_extraction(page, set(failed_codes))
@@ -906,8 +1085,8 @@ class DeterministicSolver:
                 is_scroll = page.evaluate("""\
 (() => {
     const bodyText = (document.body.textContent || '').toLowerCase();
-    if (!!document.querySelector('canvas') || bodyText.includes('audio challenge') ||
-        document.querySelectorAll('[draggable="true"]').length >= 3) return false;
+    if (!!document.querySelector('canvas') || document.querySelectorAll('[draggable="true"]').length >= 3) return false;
+    if (bodyText.includes('audio') && (bodyText.includes('play') || bodyText.includes('listen') || bodyText.includes('challenge'))) return false;
     const els = document.querySelectorAll('h1, h2, h3, .text-2xl, .text-3xl, .text-xl, .font-bold, .text-lg');
     for (const el of els) {
         const t = (el.textContent || '').toLowerCase();
@@ -974,7 +1153,12 @@ class DeterministicSolver:
                 result.success = True
                 break
 
-            # 8. Gemini vision fallback (like the reference implementation)
+            # 8. Hide stuck modals before vision (matching reference attempt >= 2)
+            if attempt >= 2:
+                from src.solver.challenge_handlers import _hide_stuck_modals
+                _hide_stuck_modals(page)
+
+            # 9. Gemini vision fallback (like the reference implementation)
             if self.use_vision and attempt >= 1:
                 result = self._vision_attempt(
                     page, step_number, attempt, failed_codes, result,
@@ -983,7 +1167,7 @@ class DeterministicSolver:
                 if result.success:
                     break
 
-            # 9. Periodic retries
+            # 10. Periodic retries
             if attempt >= 3 and attempt % 3 == 0:
                 html_text = page.evaluate("() => document.body.textContent || ''")
                 html_lower = html_text.lower()
@@ -1009,7 +1193,7 @@ class DeterministicSolver:
                 if result.success:
                     break
 
-            # 10. Hide stuck modals at attempt 5
+            # 11. Hide stuck modals at attempt 5
             if attempt == 5:
                 from src.solver.challenge_handlers import _hide_stuck_modals
                 hidden = _hide_stuck_modals(page)

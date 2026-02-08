@@ -51,6 +51,9 @@ class HybridAgent:
         deterministic solver, and uses ``env.step()`` for LLM fallback.
         """
         trajectories: list[StepTrajectory] = []
+        # Track codes used in prior steps so the solver can skip stale
+        # codes that linger in React fiber state after SPA transitions.
+        used_codes: list[str] = []
 
         obs_text, info = env.reset()
         task_info = info.get("task_info", info)
@@ -65,7 +68,7 @@ class HybridAgent:
             traj = StepTrajectory(step_number=step)
 
             if self.deterministic_first:
-                traj = self._solve_step_deterministic(env, step)
+                traj = self._solve_step_deterministic(env, step, used_codes)
 
             if not traj.success and self.policy is not None:
                 logger.info("Step %d: deterministic failed, falling back to LLM", step)
@@ -110,7 +113,9 @@ class HybridAgent:
 
         return trajectories
 
-    def _solve_step_deterministic(self, env, step: int) -> StepTrajectory:
+    def _solve_step_deterministic(
+        self, env, step: int, used_codes: list[str] | None = None,
+    ) -> StepTrajectory:
         """Try deterministic solver using direct page access."""
         traj = StepTrajectory(step_number=step, solve_method="deterministic")
 
@@ -120,12 +125,15 @@ class HybridAgent:
             logger.warning("Cannot access page for deterministic solving")
             return traj
 
-        solve_result = self.solver.solve_step(page, step)
+        solve_result = self.solver.solve_step(page, step, stale_codes=used_codes)
         traj.success = solve_result.success
         traj.code_found = solve_result.code_found
         traj.challenge_type = solve_result.challenge_type.name
         traj.actions = [{"action": a, "source": "deterministic"} for a in solve_result.actions_log]
         traj.elapsed_seconds = solve_result.elapsed_seconds
+        # Accumulate codes tried for stale-code tracking
+        if used_codes is not None and solve_result.codes_tried:
+            used_codes.extend(solve_result.codes_tried)
         return traj
 
     def _solve_step_llm(self, env, obs_text: str, step: int) -> StepTrajectory:
