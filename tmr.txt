@@ -1,0 +1,14 @@
+● The code is ready. The 3072 config was working fine (7.3GB VRAM) — the crash was Claude Code eating 29GB RAM, not DPO.                                                                                      
+   
+  Tomorrow, run this in a fresh terminal (without Claude Code running):                                                                                                                                       
+                                                                                      
+  cd ~/figure_rl                                                                                                                                                                                              
+  source .venv/bin/activate                                                                                                                                                                                   
+
+  # 1. DPO training (~30-45 min)
+  python -m src.training.dpo_train
+
+  # 2. Test the DPO model on the gauntlet
+  python -m src.runner.solve_all --mode local --adapter-dir models/dpo
+
+  That's it. No need for nohup if Claude Code isn't running alongside. The DPO training was working — it was just me hogging all the RAM.

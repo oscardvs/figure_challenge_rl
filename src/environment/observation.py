@@ -157,7 +157,7 @@ class AXTreePruner:
         return truncated
 
 
-def extract_html_snippet(page, max_chars: int = 6000) -> str:
+def extract_html_snippet(page, max_chars: int = 2000) -> str:
     """Extract cleaned inner HTML of the main content area.
 
     Removes script/style/noscript tags and truncates to *max_chars*.

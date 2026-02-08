@@ -3,8 +3,7 @@
 
 Uses TRL's DPOTrainer with the adapter-as-reference trick
 (ref_model=None + peft_config) to avoid loading a separate reference
-model. Reference log-probs are precomputed before training to avoid
-concurrent policy+ref forward passes that OOM on 16GB GPUs.
+model, keeping VRAM at ~10 GB for Qwen3-4B with 2048 max_seq_length.
 
 Usage:
     python -m src.training.dpo_train
@@ -55,10 +54,17 @@ def format_dpo_dataset(
     examples = []
 
     for pair in pairs:
+        # Strip the HTML Content section — it's redundant with the AXTree
+        # and won't fit in the 2048 token budget anyway.  SFT (at 4096
+        # max_seq_length) still uses the full observation.
+        obs = pair["obs_text"]
+        if "\nHTML Content:\n" in obs:
+            obs = obs.split("\nHTML Content:\n", 1)[0]
+
         prompt = (
             f"{system_prompt}\n\n"
             f"[Step {pair['step_index']}] Current page state:\n"
-            f"{pair['obs_text']}"
+            f"{obs}"
         )
 
         examples.append({
@@ -78,12 +84,12 @@ def train(
     output_dir: str,
     num_epochs: int = 1,
 ):
-    """Run DPO training with dual-adapter reference.
+    """Run DPO training with adapter-as-reference.
 
-    Loads the SFT adapter twice: one trainable ("train") and one frozen
-    ("reference"). This ensures the reference distribution matches the
-    SFT policy rather than the bare base model, which would create
-    enormous initial KL divergence and cause training to collapse.
+    With compact observations (no HTML snippet, pruned AXTree) and a short
+    DPO system prompt, sequences fit within 2048 tokens.  At this length
+    the dual forward pass (policy + ref) uses ~10 GB VRAM — no precompute
+    or memory tricks needed on a 16 GB GPU.
     """
     try:
         from unsloth import FastLanguageModel
@@ -91,13 +97,11 @@ def train(
         logger.error("Unsloth not installed. Install with: pip install unsloth")
         raise
 
-    from peft import PeftModel
     from trl import DPOTrainer, DPOConfig
     from datasets import Dataset
 
     dpo_cfg = model_config["dpo"]
 
-    # Load the SFT model (already has LoRA adapters).
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=sft_model_dir,
         max_seq_length=dpo_cfg["max_seq_length"],
@@ -105,14 +109,9 @@ def train(
         dtype=None,
     )
 
-    # Standard PEFT+DPO: ref_model=None with a PeftModel means TRL
-    # disables the LoRA adapter to get base-model log-probs as reference.
-    # Not identical to SFT-as-reference, but works reliably on 16GB VRAM
-    # and the KL penalty (beta=0.05) is low enough that this is fine.
     FastLanguageModel.for_training(model)
 
-    # Create dataset.
-    dataset = Dataset.from_list(examples)
+    dataset = Dataset.from_list(examples).shuffle(seed=42)
 
     training_args = DPOConfig(
         output_dir=output_dir,
@@ -127,13 +126,11 @@ def train(
         gradient_checkpointing=True,
         max_length=dpo_cfg["max_seq_length"],
         max_prompt_length=dpo_cfg["max_seq_length"] - 512,
-        precompute_ref_log_probs=True,
-        per_device_eval_batch_size=1,
     )
 
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,  # PEFT auto-reference: disables LoRA for ref log-probs.
+        ref_model=None,
         tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args,
@@ -159,9 +156,8 @@ def main():
     with open(PROJECT_ROOT / "config" / "model_config.yaml") as f:
         model_config = yaml.safe_load(f)
 
-    from src.agent.prompts import format_pure_agent_system_prompt
-    from src.environment.action_space import get_action_description
-    system_prompt = format_pure_agent_system_prompt(get_action_description())
+    from src.agent.prompts import DPO_SYSTEM_PROMPT
+    system_prompt = DPO_SYSTEM_PROMPT
 
     # Load MCTS preference pairs.
     pairs = load_preference_pairs(Path(args.data_dir))

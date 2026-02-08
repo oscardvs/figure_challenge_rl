@@ -2,8 +2,8 @@
 
 # Base model for training
 base_model:
-  name: "Qwen/Qwen2.5-3B-Instruct"
-  quantized_name: "unsloth/Qwen2.5-3B-Instruct-bnb-4bit"
+  name: "Qwen/Qwen3-4B"
+  quantized_name: "unsloth/Qwen3-4B-unsloth-bnb-4bit"
 
 # QLoRA configuration
 qlora:
@@ -21,7 +21,7 @@ qlora:
 
 # SFT training
 sft:
-  max_seq_length: 6144  # Increased from 4096 for html_snippet in observations
+  max_seq_length: 4096  # Reduced from 6144 — compact observations (AXTree 1200 tok + HTML 2000 chars)
   per_device_batch_size: 2
   gradient_accumulation_steps: 4
   learning_rate: 2.0e-4
@@ -35,9 +35,9 @@ sft:
 dpo:
   beta: 0.05             # Reduced from 0.1 — less aggressive KL penalty for RL agents
   learning_rate: 5.0e-6
-  per_device_batch_size: 2
+  per_device_batch_size: 2    # Fits at 2048 seq_length — dual forward pass uses ~10GB on 16GB GPU
   gradient_accumulation_steps: 4
-  max_seq_length: 2048
+  max_seq_length: 2048        # Compact obs (no HTML, pruned AXTree) + short DPO prompt fit here
   num_epochs: 2          # Increased from 1 — single epoch is too few for small data
   ref_model: null  # adapter-as-reference
 

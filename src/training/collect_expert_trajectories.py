@@ -48,7 +48,7 @@ def _make_obs_extractor(env, page, pruner):
         except Exception:
             # Fallback: return minimal observation.
             return f"URL: {page.url}\n[observation extraction failed]"
-        html_snippet = extract_html_snippet(page, max_chars=6000)
+        html_snippet = extract_html_snippet(page, max_chars=2000)
         return extract_obs_text(obs, pruner, html_snippet=html_snippet)
 
     return extract
@@ -76,7 +76,7 @@ def collect_step(
     )
     solver = DeterministicSolver(max_attempts=15, step_timeout=60.0)
     detector = ChallengeDetector()
-    pruner = AXTreePruner(visible_only=False, with_bid_only=True, target_tokens=2000)
+    pruner = AXTreePruner(visible_only=False, with_bid_only=True, target_tokens=1200)
 
     try:
         obs_text, info = env.reset()

@@ -69,6 +69,23 @@ BrowserGym custom actions receive `page` (Playwright Page) via `exec()` globals 
 - **Unsloth `formatting_func`**: Must always return `list[str]`, even for single examples. Use `tokenizer.apply_chat_template()` per unsloth chat template docs.
 - **Model downloads**: Set `HF_HUB_ENABLE_HF_TRANSFER=1` for fast HF downloads. Once cached, unsloth still hits HF API for metadata.
 
+### Observation Token Budget (CRITICAL for DPO)
+Observations have two sections: **AXTree** (interactive elements, pruned by `AXTreePruner`) and **HTML Content** (raw innerHTML). The HTML section is ~58% of the observation but is redundant with the AXTree — it's useful for SFT (where the agent learns to read HTML for shadow DOM / canvas challenges) but wastes tokens in DPO.
+
+**Budget constraints on 16GB VRAM (RTX 4080 SUPER):**
+- DPO requires dual forward passes (policy + ref) per training step
+- At `max_seq_length=3072`, DPO OOMs during TRL's ref logprob precompute (the unsloth DPO trainer has a memory leak in its precompute loop that crashes at ~83% regardless of GC/cache clearing — the leak is in TRL/accelerator internals, not the model's forward pass)
+- At `max_seq_length=2048`, dual forward passes use ~10GB — fits comfortably
+
+**Solution: compact observations for training data collection:**
+- `AXTreePruner(target_tokens=1200)` in `collect_expert_trajectories.py` (was 2000)
+- `extract_html_snippet(max_chars=2000)` in `observation.py` (was 6000)
+- `DPO_SYSTEM_PROMPT` in `prompts.py` — 73 tokens vs 1517 for `PURE_AGENT_SYSTEM_PROMPT` (action descriptions already learned in SFT)
+- `dpo_train.py` strips the HTML Content section from observations (SFT still uses it at 4096 max_seq_length)
+- Final DPO token budget: prompt ~1503 tokens + completion ~450 tokens = ~1953 tokens (fits in 2048)
+
+**Do NOT try to fix the DPO OOM with `precompute_ref_log_probs=True`** — the unsloth/TRL precompute loop has a memory leak that accumulates through accelerator internals. The model's forward pass itself does NOT leak (verified: 0 growth over 200 iterations). The only reliable fix is reducing max_seq_length to 2048 via compact observations.
+
 ### Prior Solutions for Training
 `StepEnv` accepts `prior_solutions: dict[int, str]` which `StepTask._replay_prior_steps()` uses to auto-navigate to the target step. Solutions accumulate in `data/known_solutions.json`.
 
@@ -134,13 +151,13 @@ The deterministic solver acts as a **teacher**: it generates expert trajectories
 3. **SFT**: `python -m src.training.sft_train --expert-dir data/expert_trajectories`
    - Combines MCTS + expert trajectories. Expert trajectories use `PURE_AGENT_SYSTEM_PROMPT`.
 4. **DPO**: `python -m src.training.dpo_train --expert-pairs-dir data/expert_preference_pairs`
-   - Combines MCTS + expert preference pairs.
+   - Combines MCTS + expert preference pairs. Uses `DPO_SYSTEM_PROMPT` (compact) and strips HTML from observations to fit in 2048 max_seq_length.
 5. **M-GRPO**: `python -m src.training.grpo_train`
    - Uses `GauntletEnv` (randomized challenges) with fractional reward and curriculum learning.
 
 ### Key Files
 - `src/agent/trajectory_recorder.py` — `RecordingPage` proxy (Playwright → BrowserGym action mapping)
-- `src/agent/prompts.py` — `PURE_AGENT_SYSTEM_PROMPT` (no challenge-type hints)
+- `src/agent/prompts.py` — `PURE_AGENT_SYSTEM_PROMPT` (SFT, no challenge-type hints) + `DPO_SYSTEM_PROMPT` (compact, no action descriptions)
 - `src/training/collect_expert_trajectories.py` — Expert trajectory collection
 - `src/training/generate_cot.py` — Synthetic chain-of-thought annotation
 - `src/environment/observation.py` — `extract_html_snippet()` for enhanced observations

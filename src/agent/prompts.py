@@ -132,6 +132,16 @@ def format_pure_agent_system_prompt(action_description: str) -> str:
     return PURE_AGENT_SYSTEM_PROMPT.format(action_description=action_description)
 
 
+# Compact prompt for DPO/preference training — the model already learned action
+# syntax during SFT, so we drop the verbose action descriptions to stay within
+# 2048 max_seq_length.
+DPO_SYSTEM_PROMPT = """\
+You are a browser agent solving navigation puzzles. Find the hidden 6-character \
+code, enter it, and click "Submit Code". Use the accessibility tree [bid] tags \
+for actions. Use js_eval() for shadow DOM, canvas, audio, iframes, or CSS-hidden \
+content. Ignore decoy buttons. Output: <think>reasoning</think>\\naction(args)"""
+
+
 def format_observation_message(observation_text: str, step: int) -> str:
     """Format an observation as a user message for the LLM."""
     return f"[Action {step}] Current page state:\n{observation_text}"

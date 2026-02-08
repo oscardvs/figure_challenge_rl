@@ -22,7 +22,7 @@ defaults:
   viewport:
     width: 1280
     height: 720
-  headless: true
+  headless: false
 
 # MCTS data collection
 mcts:
