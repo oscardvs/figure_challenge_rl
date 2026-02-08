@@ -36,7 +36,7 @@ python -m src.runner.solve_all --mode deterministic
 # Hybrid mode — deterministic solver first, LLM fallback for unsolved steps
 python -m src.runner.solve_all --mode hybrid --provider google
 
-# Local mode — fine-tuned Qwen2.5-3B (requires training first)
+# Local mode — fine-tuned Qwen3-4B (requires training first)
 python -m src.runner.solve_all --mode local
 ```
 
@@ -51,15 +51,14 @@ Two methods for generating training data:
 The deterministic solver acts as a teacher. It runs Playwright to solve challenges while a `RecordingPage` proxy intercepts every call and translates it to BrowserGym action format. This produces clean, labeled trajectories with no API cost.
 
 ```bash
-# Collect trajectories for all 30 steps, 15 runs each
-# Challenges are randomized per run, so more runs = more challenge type diversity
-python -m src.training.collect_expert_trajectories --runs-per-step 15
+# Collect trajectories for all 30 steps, 5 runs each
+python -m src.training.collect_expert_trajectories --runs-per-step 5
 
 # Collect specific steps only
 python -m src.training.collect_expert_trajectories --steps 1 2 3 4 5 --runs-per-step 10
 
-# Large overnight run for maximum coverage
-python -m src.training.collect_expert_trajectories --runs-per-step 20
+# Watch the solver in a visible browser window (useful for debugging)
+# Set headless: false in config/challenge_config.yaml, then run as normal
 ```
 
 Output:
@@ -68,9 +67,31 @@ Output:
 
 Multiple runs **merge** with existing data (append, not overwrite), so you can run collection incrementally.
 
-**Why multiple runs?** Challenges are randomized per run. Step 2 might be a scroll challenge one time and a shadow DOM challenge the next. The solver handles ~21/30 challenge types, so 15+ runs per step gives good probability of hitting solvable variants at each position.
+#### How collection works
 
-**Check coverage after collection:**
+The gauntlet is a **sequential React SPA**: you must start at step 1 and solve each step in order to reach the next. There is no way to jump directly to step 15 — you have to solve steps 1 through 14 first.
+
+Challenges are **randomized on every page load**. Each time you open a fresh browser and click START, the 30 step positions get randomly assigned challenge types and codes. So step 5 might be a "hover reveal" challenge on one run and a "shadow DOM" challenge on the next.
+
+To collect a trajectory for step N, the script:
+
+1. Opens a **fresh Chromium browser** (new session, new randomization)
+2. Clicks START and lands on step 1
+3. Solves steps 1 through N-1 sequentially (unrecorded, just to reach the target)
+4. **Records** the solver's actions on step N via the `RecordingPage` proxy
+5. Closes the browser
+
+Each "run" repeats this entire process from scratch. With `--runs-per-step 5`, five separate browser sessions are opened for the same target step, each seeing a different randomization of challenges and codes. This is how we get diverse training data: the model sees many different challenge types at the same step position.
+
+```
+Run 0: [browser 1] START → step 1 → step 2 → ... → step N-1 → RECORD step N → close
+Run 1: [browser 2] START → step 1 → step 2 → ... → step N-1 → RECORD step N → close
+Run 2: [browser 3] START → step 1 → step 2 → ... → step N-1 → RECORD step N → close
+```
+
+The trade-off: higher step numbers are slower to collect because each run must solve all prior steps as warm-up. Step 20 requires solving 19 steps before recording even begins. If any warm-up step hits a challenge type the solver can't handle, that entire run fails.
+
+#### Check coverage after collection
 
 ```bash
 python -c "
@@ -126,7 +147,7 @@ Three-stage pipeline: SFT -> DPO -> M-GRPO. Each stage builds on the previous on
 
 ### Stage 1: Supervised Fine-tuning (SFT)
 
-Trains Qwen2.5-3B with QLoRA on successful trajectories. Learns the basic observation -> action mapping.
+Trains Qwen3-4B with QLoRA on successful trajectories. Learns the basic observation -> action mapping.
 
 ```bash
 # Train on expert trajectories only
@@ -140,6 +161,26 @@ python -m src.training.sft_train --expert-dir data/expert_trajectories --epochs 
 
 # Output: models/sft/
 ```
+
+#### QLoRA Rank Tuning
+
+LoRA rank (`r`) controls the number of trainable parameters. Higher rank = more capacity but more overfitting risk, especially with small datasets.
+
+| Rank | Alpha | Trainable params | % of 4B | Notes |
+|------|-------|-----------------|---------|-------|
+| r=16 | 32 | 33M | 1.3% | Default — good for <500 trajectories |
+| r=32 | 64 | 66M | 2.6% | Consider at 500+ trajectories |
+| r=64 | 128 | 132M | 5.0% | For 1000+ trajectories, tight on 16GB |
+| r=128 | 256 | 264M | 9.5% | Not recommended on 16GB VRAM |
+
+**Guidelines** (from [Unsloth LoRA Hyperparameters Guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide/lora-hyperparameters-guide)):
+- Keep `alpha = 2 * rank` or `alpha = rank`
+- Training loss below 0.2 signals overfitting — reduce epochs or increase dropout
+- 1-3 epochs recommended; >3 epochs gives diminishing returns with small data
+- `lora_dropout=0.05` helps regularize with <500 examples
+- Target all linear layers (q/k/v/o_proj + gate/up/down_proj) for best results
+
+See also: [QLoRA paper](https://arxiv.org/abs/2305.14314), [Unsloth Fine-tuning Guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide)
 
 ### Stage 2: Direct Preference Optimization (DPO)
 
@@ -270,6 +311,139 @@ Codes are 6-character alphanumeric strings (e.g., `K7SMGA`), dynamically generat
 | Google | `--provider google` | `gemini-3-flash-preview` | `GOOGLE_API_KEY` |
 | Anthropic | `--provider anthropic` | `claude-sonnet-4-20250514` | `ANTHROPIC_API_KEY` |
 | OpenAI | `--provider openai` | `gpt-4o` | `OPENAI_API_KEY` |
+
+## Training Parameters Reference
+
+All parameters are in `config/model_config.yaml`.
+
+### Base Model
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `base_model.name` | `Qwen/Qwen3-4B` | Full-precision model name |
+| `base_model.quantized_name` | `unsloth/Qwen3-4B-unsloth-bnb-4bit` | 4-bit quantized for training |
+
+### QLoRA
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `r` | 16 | LoRA rank — 33M trainable params (1.3% of 4B) |
+| `alpha` | 32 | Scaling factor — `alpha = 2 * r` |
+| `dropout` | 0.0 | No dropout (small dataset, few epochs) |
+| `target_modules` | q/k/v/o_proj + gate/up/down_proj | All linear layers |
+
+### SFT
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `max_seq_length` | 6144 | Observations are ~2500 tokens + 1522 token system prompt |
+| `per_device_batch_size` | 2 | |
+| `gradient_accumulation_steps` | 4 | Effective batch size = 8 |
+| `learning_rate` | 2e-4 | Standard for QLoRA SFT |
+| `num_epochs` | 5 | Small dataset needs more passes |
+| `warmup_ratio` | 0.1 | |
+| `gradient_checkpointing` | `"unsloth"` | Unsloth's optimized checkpointing |
+
+### DPO
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `beta` | 0.05 | KL penalty weight — low for RL agents |
+| `learning_rate` | 5e-6 | ~40x lower than SFT to avoid catastrophic forgetting |
+| `per_device_batch_size` | 1 | DPO needs 4 forward passes per step (chosen+rejected × model+ref) |
+| `gradient_accumulation_steps` | 8 | Effective batch size = 8 |
+| `max_seq_length` | 6144 | Must match SFT — observations are large |
+| `max_prompt_length` | 5632 | `max_seq_length - 512` — actions are short (~50 tokens) |
+| `num_epochs` | 2 | |
+| `ref_model` | dual-adapter | Loads SFT adapter twice (trainable + frozen reference) |
+
+### M-GRPO
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `kl_coefficient` | 0.001 | Very low — allow policy to diverge from SFT |
+| `clip_epsilon` | 0.2 | PPO-style clipping |
+| `group_size` | 8 | Rollouts per challenge for advantage estimation |
+| `max_new_tokens` | 512 | Generation budget per action |
+| `sampling_temperature` | 0.8 | |
+| `rollout_episodes` | 500 | |
+| `curriculum_max_steps` | 5 | Start easy, expand as success rate improves |
+
+### Local Inference
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| `temperature` | 0.7 | Inherited from GRPO config |
+| `max_new_tokens` | 512 | |
+| `max_seq_length` | 6144 | Matches training |
+| `repetition_penalty` | 1.15 | Prevents action loops |
+| `top_p` | 0.9 | Nucleus sampling |
+
+## Local Mode (`--mode local`)
+
+Loads the fine-tuned LoRA adapter and runs inference locally using the same Unsloth stack as training.
+
+```bash
+# Default adapter (models/sft/)
+python -m src.runner.solve_all --mode local
+
+# Specific checkpoint
+python -m src.runner.solve_all --mode local --adapter-dir models/sft/checkpoint-45
+
+# DPO model
+python -m src.runner.solve_all --mode local --adapter-dir models/dpo
+```
+
+### How it works
+
+`LocalPolicy` in `src/agent/policy.py`:
+
+1. **Model loading**: Tries Unsloth `FastLanguageModel.from_pretrained()` first (applies inference optimizations via `.for_inference()`), falls back to PEFT `AutoPeftModelForCausalLM` + 4-bit BitsAndBytes.
+
+2. **Prompt format**: Uses `PURE_AGENT_SYSTEM_PROMPT` — the same prompt expert trajectories were trained on. No challenge-type hints.
+
+3. **Multi-turn conversation**: Maintains conversation history within each step, matching the exact training format:
+   ```
+   system prompt
+   user: "Complete step N.\n\n[Action 0] Current page state:\n{obs}"
+   assistant: "click(bid)"
+   user: "[Action 1] Current page state:\n{obs}"
+   assistant: "js_eval(...)"
+   ...
+   ```
+
+4. **Context management**: Monitors token count and trims oldest conversation turns (keeping the first user message with task instruction) to stay within `max_seq_length`. Prevents the right-truncation problem where the tokenizer would chop the most recent observation.
+
+5. **Step transitions**: Detects step changes from the task prompt and resets conversation history.
+
+6. **Generation**: `model.generate()` with `repetition_penalty=1.15` to prevent action loops, dual EOS tokens (`<|im_end|>` + `<|endoftext|>`) for robust stopping.
+
+### Performance
+
+On RTX 4080 SUPER (16GB VRAM):
+- Model load: ~30s (first time), ~10s (cached)
+- Per-action generation: ~1-3s
+- VRAM usage: ~5GB (4-bit quantized)
+
+## Pipeline Status
+
+Current data coverage:
+
+| Steps | Expert Trajectories | Preference Pairs | Notes |
+|-------|-------------------|-----------------|-------|
+| 1-12 | 137 successful | 849 pairs | Good coverage |
+| 13-25 | 0 successful | 0 pairs | Solver fails on these challenge types |
+| 26-30 | Not attempted | — | Need steps 13-25 first |
+
+### Lessons Learned
+
+- **SFT loss 0.85 → 0.05** over 5 epochs with 115 expert trajectories. Model generates valid BrowserGym actions but has JavaScript knowledge gaps (e.g., `NodeList.map()` instead of `Array.from(...).map()`).
+- **CoT annotation matters**: Without reasoning in `<think>` blocks, the model pattern-matches actions without understanding observations. With CoT, it learns to attend to relevant page clues before acting.
+- **DPO `max_seq_length` must match SFT**: Observations are ~2500 tokens + 1522 token system prompt. The original DPO config of 2048 truncated everything to garbage.
+- **Context window management is critical for local inference**: After ~5 multi-turn exchanges, the conversation exceeds `max_seq_length`. Without active trimming, right-truncation chops the latest observation and the model degenerates into outputting observation-like text.
+- **Repetition penalty (1.15) prevents action loops**: Without it, the model repeats the same `js_eval(scrollTo...)` indefinitely.
+- **Never `el.remove()` React DOM nodes**: Use CSS hiding instead. Removing React-managed nodes desynchronizes the virtual DOM and crashes the SPA permanently.
+- **Never reload the page at step 2+**: The SPA uses client-side routing. `page.reload()` destroys routing state.
 
 ## Debug
 

@@ -3,7 +3,8 @@
 
 Uses TRL's DPOTrainer with the adapter-as-reference trick
 (ref_model=None + peft_config) to avoid loading a separate reference
-model, keeping VRAM at ~7 GB for Qwen2.5-3B.
+model. Reference log-probs are precomputed before training to avoid
+concurrent policy+ref forward passes that OOM on 16GB GPUs.
 
 Usage:
     python -m src.training.dpo_train
@@ -104,20 +105,11 @@ def train(
         dtype=None,
     )
 
-    # Load a second copy of the SFT adapter as frozen reference.
-    # With ref_model=None + adapter names, DPOTrainer swaps adapters
-    # to compute reference log-probs instead of using the bare base model.
-    if isinstance(model, PeftModel):
-        # Rename the existing adapter to "train".
-        # PeftModel's default adapter is named "default".
-        model.load_adapter(sft_model_dir, adapter_name="reference")
-        logger.info("Loaded dual adapters: 'default' (trainable) + 'reference' (frozen)")
-    else:
-        logger.warning(
-            "Model is not a PeftModel — falling back to ref_model=None. "
-            "This uses the bare base model as reference, which may cause "
-            "training instability after SFT."
-        )
+    # Standard PEFT+DPO: ref_model=None with a PeftModel means TRL
+    # disables the LoRA adapter to get base-model log-probs as reference.
+    # Not identical to SFT-as-reference, but works reliably on 16GB VRAM
+    # and the KL penalty (beta=0.05) is low enough that this is fine.
+    FastLanguageModel.for_training(model)
 
     # Create dataset.
     dataset = Dataset.from_list(examples)
@@ -132,23 +124,22 @@ def train(
         bf16=True,
         logging_steps=10,
         save_strategy="epoch",
+        gradient_checkpointing=True,
         max_length=dpo_cfg["max_seq_length"],
-        max_prompt_length=dpo_cfg["max_seq_length"] // 2,
-        # Use the dual-adapter approach: DPOTrainer computes reference
-        # log-probs by switching to "reference" adapter (frozen SFT policy).
-        model_adapter_name="default",
-        ref_adapter_name="reference",
+        max_prompt_length=dpo_cfg["max_seq_length"] - 512,
+        precompute_ref_log_probs=True,
+        per_device_eval_batch_size=1,
     )
 
     trainer = DPOTrainer(
         model=model,
-        ref_model=None,  # Dual-adapter: reference computed via adapter swap.
+        ref_model=None,  # PEFT auto-reference: disables LoRA for ref log-probs.
         tokenizer=tokenizer,
         train_dataset=dataset,
         args=training_args,
     )
 
-    logger.info("Starting DPO training (dual-adapter reference)...")
+    logger.info("Starting DPO training...")
     trainer.train()
 
     model.save_pretrained(output_dir)

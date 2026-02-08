@@ -9,6 +9,8 @@ Usage:
     python -m src.runner.solve_all --mode api                   # Explicit API mode
     python -m src.runner.solve_all --mode deterministic         # Deterministic solver only (no LLM cost)
     python -m src.runner.solve_all --mode hybrid --provider google  # Deterministic + LLM fallback
+    python -m src.runner.solve_all --mode local                 # Local SFT model (models/sft)
+    python -m src.runner.solve_all --mode local --adapter-dir models/sft/checkpoint-45
     python -m src.runner.solve_all --provider openai            # Use GPT-4o instead
 """
 
@@ -26,7 +28,7 @@ from dotenv import load_dotenv
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from src.agent.policy import LLMPolicy
+from src.agent.policy import LLMPolicy, LocalPolicy
 from src.agent.prompts import format_gauntlet_task_prompt
 from src.environment.action_space import get_action_description
 from src.environment.browser_env import GauntletEnv
@@ -50,10 +52,10 @@ def load_configs():
 
 
 def solve_gauntlet_api(
-    policy: LLMPolicy,
+    policy: LLMPolicy | LocalPolicy,
     challenge_config: dict,
 ) -> RunMetrics:
-    """Solve the full 30-step gauntlet using the API model."""
+    """Solve the full 30-step gauntlet using an LLM or local model policy."""
     defaults = challenge_config["defaults"]
     max_total = defaults.get("max_actions_total", 500)
 
@@ -220,6 +222,7 @@ def main():
     )
     parser.add_argument("--provider", default="anthropic", choices=["anthropic", "openai", "google"])
     parser.add_argument("--model", default=None)
+    parser.add_argument("--adapter-dir", default="models/sft", help="LoRA adapter dir for --mode local")
     parser.add_argument("--output", default=None, help="Metrics output path")
     args = parser.parse_args()
 
@@ -254,10 +257,17 @@ def main():
             run_metrics = solve_gauntlet_hybrid(policy, challenge_config)
 
     elif args.mode == "local":
-        raise NotImplementedError(
-            "Local model inference not yet implemented. "
-            "Use --mode api for now, or complete training first."
+        adapter_dir = args.model or args.adapter_dir
+        action_desc = get_action_description()
+        sft_cfg = model_config.get("sft", {})
+        policy = LocalPolicy(
+            adapter_dir=adapter_dir,
+            max_new_tokens=model_config.get("grpo", {}).get("max_new_tokens", 512),
+            temperature=model_config.get("grpo", {}).get("sampling_temperature", 0.7),
+            max_seq_length=sft_cfg.get("max_seq_length", 6144),
+            action_description=action_desc,
         )
+        run_metrics = solve_gauntlet_api(policy, challenge_config)
 
     run_metrics.save(output_path)
     run_metrics.print_summary()

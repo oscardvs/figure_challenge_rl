@@ -494,11 +494,29 @@ def deep_code_extraction(page, known_codes: set[str] | None = None) -> list[str]
 # ---------------------------------------------------------------------------
 
 def _try_animated_button_submit(page, code: str, step: int) -> bool:
-    """Freeze animated elements and click them as an alternate submit."""
+    """Freeze animated elements and click them one-by-one as alternate submit.
+
+    Each animated element is frozen at screen centre, clicked, and then hidden
+    if the click did not advance the step — so the *next* element underneath
+    becomes the click target.  This avoids the previous bug where all elements
+    were stacked at the same z-index and only the topmost one was ever hit.
+    """
     try:
-        result = page.evaluate("""\
+        # Restore any elements hidden by a previous call and clear old tags.
+        page.evaluate("""\
 (() => {
-    const animated = [];
+    document.querySelectorAll('[data-anim-btn-idx]').forEach(el => {
+        el.style.display = '';
+        el.style.pointerEvents = '';
+        el.removeAttribute('data-anim-btn-idx');
+    });
+})()""")
+
+        # Tag each animated element with a unique ID so we can target them
+        # individually from Python.
+        count = page.evaluate("""\
+(() => {
+    let idx = 0;
     document.querySelectorAll('*').forEach(el => {
         const style = getComputedStyle(el);
         const cls = el.getAttribute('class') || '';
@@ -508,49 +526,53 @@ def _try_animated_button_submit(page, code: str, step: int) -> bool:
         const isSmall = el.offsetWidth > 10 && el.offsetWidth < 200 &&
             el.offsetHeight > 10 && el.offsetHeight < 200;
         const isClickable = style.cursor === 'pointer' || cls.includes('cursor-pointer');
-        if (hasAnimation && isSmall && isClickable && el.offsetParent) animated.push(el);
+        if (hasAnimation && isSmall && isClickable && el.offsetParent) {
+            el.setAttribute('data-anim-btn-idx', String(idx++));
+        }
     });
-    if (animated.length === 0) return {found: false};
-    const results = [];
-    for (const el of animated) {
-        el.style.animation = 'none';
-        el.style.position = 'fixed';
-        el.style.top = '50%';
-        el.style.left = '50%';
-        el.style.zIndex = '99999';
-        el.style.transform = 'translate(-50%, -50%)';
-        const r = el.getBoundingClientRect();
-        results.push({x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
-            text: (el.textContent || '').trim().substring(0, 40)});
-    }
-    return {found: true, elements: results};
+    return idx;
 })()""")
-        if not result or not result.get("found"):
+        if not count:
             return False
 
-        # Fill code
-        page.evaluate(f"""\
-(() => {{
-    const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
-    if (inp) {{
-        const s = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-        s.call(inp, '{code}');
-        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-    }}
-}})()""")
+        # Fill code once up-front.
+        _fill_code_in_input(page, code)
         time.sleep(0.1)
 
-        for el in result.get("elements", []):
+        for i in range(count):
             clear_popups(page)
+            # Freeze this specific element at screen centre and click it.
+            info = page.evaluate(f"""\
+(() => {{
+    const el = document.querySelector('[data-anim-btn-idx="{i}"]');
+    if (!el || el.style.display === 'none') return null;
+    el.style.animation = 'none';
+    el.style.position = 'fixed';
+    el.style.top = '50%';
+    el.style.left = '50%';
+    el.style.zIndex = '99999';
+    el.style.transform = 'translate(-50%, -50%)';
+    const r = el.getBoundingClientRect();
+    return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
+        text: (el.textContent || '').trim().substring(0, 40)}};
+}})()""")
+            if not info:
+                continue
             try:
-                page.mouse.click(el["x"], el["y"])
+                page.mouse.click(info["x"], info["y"])
             except Exception:
                 pass
             time.sleep(0.3)
             if check_progress(page.url, step):
-                logger.info("Animated button '%s' with code '%s' WORKED!", el["text"], code)
+                logger.info("Animated button '%s' with code '%s' WORKED!", info["text"], code)
                 return True
+            # Hide this element so the next one is exposed for clicking.
+            page.evaluate(f"""\
+(() => {{
+    const el = document.querySelector('[data-anim-btn-idx="{i}"]');
+    if (el) {{ el.style.display = 'none'; el.style.pointerEvents = 'none'; }}
+}})()""")
+
         return False
     except Exception as e:
         logger.warning("Animated button error: %s", e)
@@ -900,12 +922,61 @@ class ChallengeHandlers:
 
     def handle_audio(self, page) -> HandlerResult:
         log: list[str] = []
+
+        # Inject interception hooks for SpeechSynthesis and Audio BEFORE
+        # clicking Play.  Without these, __capturedSpeechUtterance and
+        # __capturedAudio stay null and the force-end code below does nothing.
         page.evaluate("""\
 (() => {
-    window.__capturedSpeechTexts = window.__capturedSpeechTexts || [];
-    window.__capturedSpeechUtterance = window.__capturedSpeechUtterance || null;
+    if (window.__audioFullPatched) return;
+    window.__capturedSpeechTexts = [];
+    window.__capturedSpeechUtterance = null;
     window.__speechDone = false;
+    window.__capturedAudioSrc = null;
+    window.__capturedAudio = null;
+    window.__audioFullPatched = true;
+
+    // 1. SpeechSynthesis interception
+    if (window.speechSynthesis) {
+        const origSpeak = window.speechSynthesis.speak.bind(window.speechSynthesis);
+        window.speechSynthesis.speak = function(utterance) {
+            window.__capturedSpeechTexts.push(utterance.text);
+            window.__capturedSpeechUtterance = utterance;
+            return origSpeak(utterance);
+        };
+    }
+
+    // 2. Audio constructor interception
+    const OrigAudio = window.Audio;
+    window.Audio = function(src) {
+        const audio = new OrigAudio(src);
+        window.__capturedAudioSrc = src || null;
+        window.__capturedAudio = audio;
+        return audio;
+    };
+    window.Audio.prototype = OrigAudio.prototype;
+
+    // 3. HTMLAudioElement.play interception
+    const origPlay = HTMLAudioElement.prototype.play;
+    HTMLAudioElement.prototype.play = function() {
+        window.__capturedAudioSrc = this.src || this.currentSrc;
+        window.__capturedAudio = this;
+        return origPlay.call(this);
+    };
+
+    // 4. URL.createObjectURL interception for blob audio
+    const origCreateObjUrl = URL.createObjectURL;
+    URL.createObjectURL = function(obj) {
+        const url = origCreateObjUrl.call(URL, obj);
+        if (obj instanceof Blob && (obj.type.includes('audio') || obj.type === '')) {
+            window.__capturedBlobUrl = url;
+            window.__capturedBlob = obj;
+        }
+        return url;
+    };
 })()""")
+        log.append("audio: injected interception hooks")
+
         play_result = page.evaluate("""\
 (() => {
     const btns = [...document.querySelectorAll('button')];
@@ -960,6 +1031,17 @@ class ChallengeHandlers:
                 log.append("audio: clicked complete")
                 break
             time.sleep(0.5)
+        else:
+            # Last resort: click "Playing..." button (might toggle to Complete)
+            page.evaluate("""\
+(() => {
+    for (const btn of document.querySelectorAll('button')) {
+        const text = (btn.textContent || '').trim().toLowerCase();
+        if (text.includes('playing') && btn.offsetParent) { btn.click(); return; }
+    }
+})()""")
+            log.append("audio: clicked Playing as fallback")
+            time.sleep(1.0)
         time.sleep(1.0)
         return HandlerResult(actions_log=log, needs_extraction=True)
 

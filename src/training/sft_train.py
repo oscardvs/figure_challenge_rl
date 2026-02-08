@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Stage 1: Supervised Fine-Tuning on successful MCTS trajectories.
 
-Trains Qwen2.5-3B-Instruct with QLoRA on expert trajectories collected
-during MCTS data collection. Each training example is a multi-turn
-conversation: system prompt → task → observation → action → ...
+Trains the base model (configured in config/model_config.yaml) with QLoRA
+on expert trajectories. Each training example is a multi-turn conversation:
+system prompt → task → observation → action → ...
 
 Usage:
     python -m src.training.sft_train
@@ -107,6 +107,12 @@ def train(
     sft_cfg = model_config["sft"]
     qlora_cfg = model_config["qlora"]
 
+    # Increase HF Hub timeout (default 10s is too short for flaky connections).
+    # Must patch the constant directly since it's evaluated at import time.
+    import huggingface_hub.constants
+    huggingface_hub.constants.HF_HUB_ETAG_TIMEOUT = 120
+    huggingface_hub.constants.HF_HUB_DOWNLOAD_TIMEOUT = 120
+
     # Load model with QLoRA.
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_config["base_model"]["quantized_name"],
@@ -127,6 +133,18 @@ def train(
     # Create dataset.
     dataset = Dataset.from_list(conversations)
 
+    def formatting_func(example):
+        convos = example["messages"]
+        # Single example: convos is a list of message dicts → wrap in list.
+        if convos and isinstance(convos[0], dict):
+            convos = [convos]
+        return [
+            tokenizer.apply_chat_template(
+                convo, tokenize=False, add_generation_prompt=False
+            )
+            for convo in convos
+        ]
+
     # Training config.
     training_args = SFTConfig(
         output_dir=output_dir,
@@ -139,13 +157,13 @@ def train(
         logging_steps=10,
         save_strategy="epoch",
         max_seq_length=sft_cfg["max_seq_length"],
-        dataset_text_field=None,
     )
 
     trainer = SFTTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset,
+        formatting_func=formatting_func,
         args=training_args,
     )
 

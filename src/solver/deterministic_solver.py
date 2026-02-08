@@ -38,6 +38,12 @@ class SolveResult:
     actions_log: list[str] = field(default_factory=list)
     elapsed_seconds: float = 0.0
     attempts: int = 0
+    codes_tried: list[str] = field(default_factory=list)
+    """All 6-char codes submitted during this step (correct + wrong).
+
+    Used by callers to build stale-code lists for subsequent steps —
+    React fiber state often retains these codes after SPA transitions.
+    """
 
 
 class DeterministicSolver:
@@ -152,13 +158,24 @@ class DeterministicSolver:
 
         return result
 
-    def solve_step(self, page, step_number: int) -> SolveResult:
-        """Solve the current step.  *page* must already be at the step."""
+    def solve_step(
+        self,
+        page,
+        step_number: int,
+        stale_codes: list[str] | None = None,
+    ) -> SolveResult:
+        """Solve the current step.  *page* must already be at the step.
+
+        *stale_codes* — codes from previous steps that may still lurk in
+        React fiber state.  They are pre-seeded into ``failed_codes`` so the
+        solver never wastes time submitting them.
+        """
         t0 = time.time()
         result = SolveResult()
-        failed_codes: list[str] = []
+        failed_codes: list[str] = list(stale_codes or [])
         submit_is_trap = False
         scroll_attempted = False
+        math_solved = False
 
         # Wait for React SPA to render meaningful content
         _wait_for_page_ready(page)
@@ -259,23 +276,17 @@ class DeterministicSolver:
                         result.success = True
                         break
 
-                # Math puzzle
-                if "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
+                # Math puzzle (skip if already solved on a previous iteration)
+                if not math_solved and "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
+                    math_solved = True
                     hr = self.handlers.handle_math_puzzle(page, failed_codes)
-                    for code in hr.codes_found:
-                        if code in failed_codes:
-                            continue
-                        ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
-                        if ok:
-                            result.success = True
-                            result.code_found = code
-                            break
-                        failed_codes.append(code)
-                    if result.success:
-                        break
-                    # Post-math deep extraction
+                    all_math_codes = list(hr.codes_found)
+                    # Also do post-math deep extraction
                     post_math = deep_code_extraction(page, set(failed_codes))
-                    for code in post_math[:5]:
+                    for c in post_math[:5]:
+                        if c not in all_math_codes:
+                            all_math_codes.append(c)
+                    for code in all_math_codes:
                         if code in failed_codes:
                             continue
                         ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
@@ -283,6 +294,12 @@ class DeterministicSolver:
                             result.success = True
                             result.code_found = code
                             break
+                        # If submit is trap, try animated button
+                        if submit_is_trap:
+                            if _try_animated_button_submit_with_check(page, code, step_number):
+                                result.success = True
+                                result.code_found = code
+                                break
                         failed_codes.append(code)
                     if result.success:
                         break
@@ -318,6 +335,22 @@ class DeterministicSolver:
                     self.handlers.handle_audio(page)
                     if check_progress(page.url, step_number):
                         result.success = True
+                        break
+                    # Audio handler clicks Complete which reveals the code — extract and submit
+                    time.sleep(0.5)
+                    audio_html = page.content()
+                    audio_codes = extract_hidden_codes(audio_html)
+                    audio_deep = deep_code_extraction(page, set(failed_codes))
+                    for code in list(audio_codes) + list(audio_deep):
+                        if code in failed_codes:
+                            continue
+                        ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                        if ok:
+                            result.success = True
+                            result.code_found = code
+                            break
+                        failed_codes.append(code)
+                    if result.success:
                         break
 
                 # Canvas
@@ -486,14 +519,33 @@ class DeterministicSolver:
                     if result.success:
                         break
 
-                # Submit-is-trap: animated button
+                # Submit-is-trap: discover codes via scroll FIRST, then
+                # try all known codes with the animated button handler.
                 if submit_is_trap:
-                    time.sleep(1.5)
+                    time.sleep(0.5)
+                    # Always try scroll handler when trap detected — the real
+                    # code is often hidden in scrollable content.
+                    if not scroll_attempted:
+                        scroll_attempted = True
+                        hr = self.handlers.handle_scroll_to_find(page, failed_codes, step_number)
+                        if hr.success or check_progress(page.url, step_number):
+                            result.success = True
+                            break
+                        # Scroll may have revealed new codes.
+                        for code in hr.codes_found:
+                            if code not in failed_codes:
+                                if _try_animated_button_submit_with_check(page, code, step_number):
+                                    result.success = True
+                                    result.code_found = code
+                                    break
+                                failed_codes.append(code)
+                        if result.success:
+                            break
+
                     fresh_deep = deep_code_extraction(page, set(failed_codes))
                     all_to_try = list(dict.fromkeys(
                         (fresh_deep or []) + (deep_codes or []) + list(codes or [])
                     ))
-                    # Only try valid 6-char codes (exclude failed_codes and invalid entries)
                     all_to_try = [c for c in all_to_try
                                   if c not in failed_codes and re.fullmatch(r"[A-Z0-9]{6}", c)]
                     for code in all_to_try[:10]:
@@ -652,8 +704,9 @@ class DeterministicSolver:
                     result.success = True
                     break
 
-            # Math puzzle
-            if "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
+            # Math puzzle (skip if already solved)
+            if not math_solved and "puzzle" in html_lower and ("= ?" in html_text or "=?" in html_text):
+                math_solved = True
                 hr = self.handlers.handle_math_puzzle(page, failed_codes)
                 for code in hr.codes_found:
                     if code in failed_codes:
@@ -663,6 +716,11 @@ class DeterministicSolver:
                         result.success = True
                         result.code_found = code
                         break
+                    if submit_is_trap:
+                        if _try_animated_button_submit_with_check(page, code, step_number):
+                            result.success = True
+                            result.code_found = code
+                            break
                     failed_codes.append(code)
                 if result.success:
                     break
@@ -769,6 +827,22 @@ class DeterministicSolver:
                 self.handlers.handle_audio(page)
                 if check_progress(page.url, step_number):
                     result.success = True
+                    break
+                # Extract code revealed after clicking Complete
+                time.sleep(0.5)
+                audio_html = page.content()
+                audio_codes = extract_hidden_codes(audio_html)
+                audio_deep = deep_code_extraction(page, set(failed_codes))
+                for code in list(audio_codes) + list(audio_deep):
+                    if code in failed_codes:
+                        continue
+                    ok, submit_is_trap = fill_and_submit(page, code, step_number, submit_is_trap)
+                    if ok:
+                        result.success = True
+                        result.code_found = code
+                        break
+                    failed_codes.append(code)
+                if result.success:
                     break
 
             # Canvas
@@ -949,6 +1023,12 @@ class DeterministicSolver:
 
         result.elapsed_seconds = time.time() - t0
         result.attempts = attempt + 1 if 'attempt' in dir() else 0
+        # Expose all codes that were submitted so callers can mark them stale.
+        # Exclude any pre-seeded stale codes — only include codes from THIS step.
+        stale_set = set(stale_codes or []) if stale_codes else set()
+        result.codes_tried = [c for c in failed_codes if c not in stale_set]
+        if result.code_found and result.code_found not in result.codes_tried:
+            result.codes_tried.append(result.code_found)
         if result.success and (not result.challenge_type or result.challenge_type == ChallengeType.UNKNOWN):
             # Try to set from detection
             detections = self.detector.detect(page)
@@ -957,11 +1037,14 @@ class DeterministicSolver:
         return result
 
 
-def _wait_for_page_ready(page, timeout: float = 10.0):
+def _wait_for_page_ready(page, timeout: float = 15.0):
     """Wait for React SPA to render meaningful content.
 
-    Uses Playwright's wait_for_selector for efficient waiting (no busy-polling),
-    with page reload as fallback if React fails to mount.
+    Uses Playwright's wait_for_selector for efficient waiting (no busy-polling).
+
+    IMPORTANT: Never reloads the page. The target site is a React SPA where
+    direct URL navigation only works for step 1. Reloading at step 2+ destroys
+    client-side routing state and leaves the page permanently broken.
     """
     # 1. Wait for React root to mount children
     try:
@@ -969,20 +1052,14 @@ def _wait_for_page_ready(page, timeout: float = 10.0):
             "#root > *", state="attached", timeout=timeout * 1000
         )
     except Exception:
-        # React root empty — try reload
-        logger.warning("React did not render in %.1fs, reloading page", timeout)
-        try:
-            page.reload(wait_until="networkidle", timeout=10000)
-        except Exception as e:
-            logger.warning("Page reload failed: %s", e)
-            return
-        try:
-            page.wait_for_selector(
-                "#root > *", state="attached", timeout=timeout * 1000
-            )
-        except Exception:
-            logger.warning("React still empty after reload")
-            return
+        # React root empty — do NOT reload (breaks SPA routing for step 2+).
+        # Give React a bit more time to settle, then return best-effort.
+        logger.warning(
+            "React did not render in %.1fs (not reloading — would destroy SPA state)",
+            timeout,
+        )
+        time.sleep(2.0)
+        return
 
     # 2. Wait for interactive elements (puzzle content, not just headers)
     try:

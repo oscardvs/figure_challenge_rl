@@ -12,7 +12,7 @@ src/
   environment/ — BrowserGym wrappers (GauntletEnv, StepEnv), action space, observation pruning
   solver/      — Deterministic challenge solver (21 challenge types), hybrid agent
   training/    — SFT, DPO, GRPO training + MCTS trajectory collection
-  runner/      — solve_all.py (baseline + deterministic + hybrid modes), metrics, parallel executor
+  runner/      — solve_all.py (api + deterministic + hybrid + local modes), metrics, parallel executor
 config/        — challenge_config.yaml, model_config.yaml
 data/          — trajectories, preference_pairs, known_solutions.json
 scripts/       — debug_run.py, explore_challenges.py
@@ -25,10 +25,10 @@ Challenges are **randomized per run** — challenge type X can appear at any ste
 - `src/environment/browser_env.py` — GauntletEnv (full 30-step), StepEnv (single-step for training). Handles SPA content-wait (`_wait_for_content`), overlay dismissal, step transition detection, prior solution replay.
 - `src/environment/action_space.py` — BrowserGym HighLevelActionSet with `js_eval` custom action. The `js_eval` function injects results into a visible DOM element for AXTree readback.
 - `src/agent/prompts.py` — System prompt, action parser (`_ACTION_PATTERN` regex). The parser extracts actions from `<think>...</think>\naction()` format.
-- `src/agent/policy.py` — LLMPolicy wrapping Anthropic/OpenAI/Google API clients.
+- `src/agent/policy.py` — `LLMPolicy` (API: Anthropic/OpenAI/Google) + `LocalPolicy` (local LoRA inference via Unsloth/PEFT).
 - `src/agent/mcts.py` — MCTSSearch for trajectory + preference pair collection.
 - `src/training/collect_trajectories.py` — Orchestrates MCTS collection across steps, accumulates `data/known_solutions.json`.
-- `src/training/sft_train.py` — Supervised fine-tuning (Qwen2.5-3B + QLoRA via Unsloth).
+- `src/training/sft_train.py` — Supervised fine-tuning (Qwen3-4B + QLoRA via Unsloth).
 - `src/training/dpo_train.py` — DPO training from preference pairs.
 - `src/training/grpo_train.py` — Group-relative policy optimization with live rollouts.
 - `src/solver/challenge_detector.py` — `ChallengeDetector` classifies the current page into one of 21 challenge types via a single `page.evaluate()` JS signal collection call.
@@ -41,7 +41,13 @@ Challenges are **randomized per run** — challenge type X can appear at any ste
 ### Step Transition: Context-Manager Protected Observation
 BrowserGym's `set_of_marks` injects `bid`/`browsergym_visibility_ratio` attributes into ALL DOM elements during `_get_obs()`. This crashes React's virtual DOM reconciliation. The `_pre_extract_disabled()` context manager disables DOM mutation during `_env.step()` and guarantees restoration via `try/finally`, even on exceptions.
 
-After step transitions, `_wait_for_content()` uses a multi-signal approach: first waits for `#root > *` mount, then waits for interactive elements (buttons, inputs) to confirm puzzle content rendered. Only reloads as a last resort. `_get_reliable_obs()` retries observation extraction up to 3 times with exponential backoff.
+After step transitions, `_wait_for_content()` uses a multi-signal approach: first waits for `#root > *` mount, then waits for interactive elements (buttons, inputs) to confirm puzzle content rendered. `_get_reliable_obs()` retries observation extraction up to 3 times with exponential backoff.
+
+### CRITICAL: Never Use el.remove() on React-Managed DOM Nodes
+All popup/overlay dismissal MUST use CSS hiding (`display:none; visibility:hidden; pointer-events:none; zIndex:-1`), NOT `el.remove()`. Removing React-managed nodes desynchronizes the virtual DOM — when React later tries to unmount during step transitions, it throws `NotFoundError: Failed to execute 'removeChild'` and crashes permanently, leaving `#root` empty. The `clear_popups()` handler and `_DISMISS_OVERLAYS_JS` both use the `hide()` pattern. Only non-React elements (like `__bgym_js_result` appended directly to `document.body`) are safe to `.remove()`.
+
+### CRITICAL: Never Reload the Page at Step 2+
+Direct URL navigation only works for step 1. Calling `page.reload()` at step 2+ destroys the SPA's client-side routing state and leaves the page permanently broken (`#root` empty). The `_wait_for_page_ready()` and `_wait_for_content()` functions must never reload — they wait patiently and return best-effort if React is slow to render.
 
 **Observation quality check**: `_is_obs_valid()` checks for interactive elements (button/textbox/input/etc.) AND minimum length > 500 chars, rather than raw length alone. Some legitimate steps produce short AXTrees.
 
@@ -56,6 +62,12 @@ Current valid actions: `click`, `dblclick`, `fill`, `type`, `select_option`, `ho
 
 ### Custom Actions (js_eval)
 BrowserGym custom actions receive `page` (Playwright Page) via `exec()` globals — NOT as a function parameter. The function body references `page` directly. Function must have a docstring with an `Examples:` section.
+
+### Training Dependencies & Gotchas
+- **Unsloth/vllm/trl versions must be compatible** — unsloth pins `trl<=0.24.0` and `datasets<4.4.0`. Upgrading one without checking constraints breaks imports.
+- **HF Hub timeouts**: `HfFileSystem.glob()` in unsloth's loader uses `huggingface_hub.constants.HF_HUB_ETAG_TIMEOUT` (default 10s). Monkey-patch the constant directly before `from_pretrained()` — env vars may be evaluated at import time before your code sets them.
+- **Unsloth `formatting_func`**: Must always return `list[str]`, even for single examples. Use `tokenizer.apply_chat_template()` per unsloth chat template docs.
+- **Model downloads**: Set `HF_HUB_ENABLE_HF_TRANSFER=1` for fast HF downloads. Once cached, unsloth still hits HF API for metadata.
 
 ### Prior Solutions for Training
 `StepEnv` accepts `prior_solutions: dict[int, str]` which `StepTask._replay_prior_steps()` uses to auto-navigate to the target step. Solutions accumulate in `data/known_solutions.json`.
@@ -74,6 +86,8 @@ python -m src.runner.solve_all --provider anthropic    # Claude Sonnet (API mode
 python -m src.runner.solve_all --provider openai       # GPT-4o (API mode)
 python -m src.runner.solve_all --mode deterministic    # Deterministic solver only (no LLM cost)
 python -m src.runner.solve_all --mode hybrid --provider google  # Deterministic + LLM fallback
+python -m src.runner.solve_all --mode local            # Fine-tuned Qwen3-4B (models/sft/)
+python -m src.runner.solve_all --mode local --adapter-dir models/dpo  # DPO model
 ```
 Results written to `results/metrics.json`.
 
@@ -98,6 +112,7 @@ python -m src.training.grpo_train      # GRPO with live rollouts
 
 ## Environment Setup
 - Python 3.12, virtualenv at `.venv/`
+- Activate with `source .venv/bin/activate` before running any python commands
 - API keys in `.env`: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GOOGLE_API_KEY`
 - Playwright browsers: `playwright install chromium`
 - Key deps: `browsergym-core`, `playwright`, `torch`, `transformers`, `trl`, `unsloth`, `vllm`
@@ -105,15 +120,17 @@ python -m src.training.grpo_train      # GRPO with live rollouts
 ## Expert Trajectory Pipeline (Pure Learned Agent)
 
 ### Overview
-The deterministic solver acts as a **teacher**: it generates expert trajectories that a Qwen2.5-3B model learns from. At inference time, the trained agent solves challenges from observations alone — no hardcoded detectors or handlers.
+The deterministic solver acts as a **teacher**: it generates expert trajectories that a Qwen3-4B model learns from. At inference time, the trained agent solves challenges from observations alone — no hardcoded detectors or handlers.
 
 ### Pipeline
 1. **Collect expert trajectories**: `python -m src.training.collect_expert_trajectories`
    - Runs solver with `RecordingPage` proxy that intercepts Playwright calls and maps to BrowserGym actions.
    - Output: `data/expert_trajectories/step_NN.json` + `data/expert_preference_pairs/step_NN.json`
-2. **Add CoT reasoning**: `python -m src.training.generate_cot`
-   - Uses Gemini Flash to annotate each (obs, action) pair with 2-4 sentence reasoning.
-   - Output: Updated trajectory files with `reasoning` field.
+2. **Add CoT reasoning**: `python -m src.training.generate_cot --provider local`
+   - Annotates each (obs, action) pair with 2-4 sentence reasoning.
+   - `--provider local` uses Qwen3-14B-AWQ via vLLM batched inference (free, ~15-25 min for all steps).
+   - `--provider google` uses Gemini Flash API (costs ~$1-2, ~2.5 hours sequential).
+   - Output: Updated trajectory files with `reasoning` field. Cache: `data/cot_cache.json`.
 3. **SFT**: `python -m src.training.sft_train --expert-dir data/expert_trajectories`
    - Combines MCTS + expert trajectories. Expert trajectories use `PURE_AGENT_SYSTEM_PROMPT`.
 4. **DPO**: `python -m src.training.dpo_train --expert-pairs-dir data/expert_preference_pairs`

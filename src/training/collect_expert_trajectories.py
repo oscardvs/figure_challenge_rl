@@ -74,7 +74,7 @@ def collect_step(
         headless=config.get("headless", True),
         max_actions_per_step=30,
     )
-    solver = DeterministicSolver(max_attempts=15, step_timeout=45.0)
+    solver = DeterministicSolver(max_attempts=15, step_timeout=60.0)
     detector = ChallengeDetector()
     pruner = AXTreePruner(visible_only=False, with_bid_only=True, target_tokens=2000)
 
@@ -82,14 +82,37 @@ def collect_step(
         obs_text, info = env.reset()
         page = env._env.page
 
+        # Track codes used in prior steps so the solver can skip stale
+        # codes that linger in React fiber state after step transitions.
+        used_codes: list[str] = []
+
         # Solve prior steps without recording to reach target step.
         for s in range(1, step_number):
             logger.info(f"  Run {run_index}: solving step {s} (pre-target)")
-            result = solver.solve_step(page, s)
+            result = solver.solve_step(page, s, stale_codes=used_codes)
             if not result.success:
                 logger.warning(f"  Run {run_index}: failed to solve pre-step {s}")
                 return None
-            # Wait for next step's React content to render.
+            # Accumulate ALL codes tried on this step as stale for future steps.
+            # React fiber retains codes in memoized state after SPA transitions.
+            if result.codes_tried:
+                used_codes.extend(result.codes_tried)
+            # Wait for SPA transition: confirm URL changed, then wait for
+            # React to render the next step's content.  The SPA only supports
+            # direct navigation to step 1; reloading at step 2+ would break
+            # routing, so we rely on patient waiting, not reloads.
+            expected_next = s + 1
+            try:
+                page.wait_for_url(
+                    f"**/step{expected_next}**", timeout=5000
+                )
+            except Exception:
+                logger.warning(
+                    f"  Run {run_index}: URL did not change to step {expected_next}"
+                )
+            # Give React time to unmount old step and mount new step content
+            # before _wait_for_page_ready checks for #root children.
+            time.sleep(1.0)
             _wait_for_page_ready(page)
 
         # Now record the target step.
@@ -108,8 +131,8 @@ def collect_step(
             challenge_type=challenge_type,
         )
 
-        # Solve with recording.
-        result = solver.solve_step(recording_page, step_number)
+        # Solve with recording (pass stale codes from prior steps).
+        result = solver.solve_step(recording_page, step_number, stale_codes=used_codes)
 
         # Build trajectory.
         trajectory = recording_page.get_trajectory(

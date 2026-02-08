@@ -34,11 +34,21 @@ logger = logging.getLogger(__name__)
 # The challenge pages spawn multiple fixed-position overlays (z-index 9996-10000)
 # including cookie consent, "you won a prize", fake alerts, and fullscreen backdrops.
 # These are intentional distractions, not puzzle content.
+#
+# IMPORTANT: Use CSS hiding (display:none, pointer-events:none) instead of
+# el.remove(). Removing React-managed DOM nodes causes "removeChild" errors
+# during step transitions and crashes React, leaving #root empty permanently.
 _DISMISS_OVERLAYS_JS = """\
 (() => {
-  // Remove fullscreen backdrop overlays (fixed inset-0, high z-index).
-  document.querySelectorAll('.fixed.inset-0').forEach(el => el.remove());
-  // Remove popup modals (fixed position, z-index >= 9990).
+  const hide = (el) => {
+    el.style.display = 'none';
+    el.style.pointerEvents = 'none';
+    el.style.visibility = 'hidden';
+    el.style.zIndex = '-1';
+  };
+  // Hide fullscreen backdrop overlays (fixed inset-0, high z-index).
+  document.querySelectorAll('.fixed.inset-0').forEach(el => hide(el));
+  // Hide popup modals (fixed position, z-index >= 9990).
   document.querySelectorAll('[class*="fixed"]').forEach(el => {
     const z = parseInt(getComputedStyle(el).zIndex) || 0;
     const text = (el.textContent || '').toLowerCase();
@@ -47,16 +57,16 @@ _DISMISS_OVERLAYS_JS = """\
       el.style.pointerEvents = 'none';
       return;
     }
-    // Remove popup overlays (cookie consent, prizes, alerts, etc.)
+    // Hide popup overlays (cookie consent, prizes, alerts, etc.)
     if (z >= 9990) {
-      el.remove();
+      hide(el);
     }
   });
-  // Remove floating clickable distractors (absolute/fixed positioned "Click Me" etc.)
+  // Hide floating clickable distractors (absolute/fixed positioned "Click Me" etc.)
   document.querySelectorAll('[class*="fixed"][class*="cursor-pointer"]').forEach(el => {
     const text = (el.textContent || '').trim();
     if (['Click Me!', 'Link!', 'Here!', 'Try This!', 'Button!', 'Moving!'].includes(text)) {
-      el.remove();
+      hide(el);
     }
   });
 })();
@@ -96,13 +106,16 @@ def _get_step_from_url(url: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-def _wait_for_content(page, timeout: float = 5.0):
+def _wait_for_content(page, timeout: float = 10.0):
     """Wait until React renders content into #root after SPA navigation.
 
     Multi-signal approach:
     1. Wait for React root to have children (basic mount check).
     2. Wait for interactive elements (puzzle content, not just headers).
-    3. Fall back to reload only as last resort (destroys React state).
+
+    IMPORTANT: Never reloads the page. The target site is a React SPA where
+    direct URL navigation only works for step 1. Reloading at step 2+ destroys
+    client-side routing state and leaves the page permanently broken.
     """
     # Signal 1: Wait for React root to mount content.
     try:
@@ -110,20 +123,13 @@ def _wait_for_content(page, timeout: float = 5.0):
             "#root > *", state="attached", timeout=timeout * 1000
         )
     except Exception:
-        # React root empty — reload as fallback.
-        logger.warning("React did not render, reloading page")
-        try:
-            page.reload(wait_until="networkidle", timeout=10000)
-        except Exception as e:
-            logger.warning(f"Page reload failed: {e}")
-            return
-        try:
-            page.wait_for_selector(
-                "#root > *", state="attached", timeout=timeout * 1000
-            )
-        except Exception:
-            logger.warning("React still empty after reload")
-            return
+        # React root empty — do NOT reload (breaks SPA routing for step 2+).
+        logger.warning(
+            "React did not render in %.1fs (not reloading — would destroy SPA state)",
+            timeout,
+        )
+        time.sleep(2.0)
+        return
 
     # Signal 2: Wait for interactive puzzle content (not just the header).
     # The step header renders first; puzzle content renders after.
@@ -131,7 +137,7 @@ def _wait_for_content(page, timeout: float = 5.0):
         page.wait_for_selector(
             "button, input, [role='textbox'], canvas, [role='slider']",
             state="attached",
-            timeout=3000,
+            timeout=5000,
         )
     except Exception:
         # Some steps may not have standard interactive elements.
