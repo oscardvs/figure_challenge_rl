@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from src.solver.challenge_detector import ChallengeDetector, ChallengeType
 from src.solver.challenge_handlers import (
     ChallengeHandlers,
+    _hide_stuck_modals,
     _try_trap_buttons,
     check_progress,
     clear_popups,
@@ -536,6 +537,48 @@ class DeterministicSolver:
                             result.success = True
                             result.code_found = code
                             break
+                        # Code submission may have worked but a blocking modal
+                        # appeared (radio buttons, dismiss dialog) before URL changed.
+                        # Check for "Code accepted" text and handle blocking modals.
+                        page_text = page.evaluate("() => document.body.textContent || ''")
+                        if "Code accepted" in page_text or f"step {step_number + 1}" in page_text.lower():
+                            logger.info("Step %d: iframe code '%s' accepted but modal blocking — handling", step_number, code)
+                            # Dismiss success overlays
+                            page.evaluate("""() => {
+                                document.querySelectorAll('.fixed, [role="dialog"]').forEach(el => {
+                                    const t = el.textContent || '';
+                                    if (t.includes('Code accepted') || t.includes('Proceeding') || t.includes('Dismiss')) {
+                                        el.querySelectorAll('button').forEach(btn => {
+                                            const bt = (btn.textContent || '').trim().toLowerCase();
+                                            if (bt === 'dismiss' || bt === 'close' || bt === 'ok' || bt === 'continue') btn.click();
+                                        });
+                                    }
+                                });
+                            }""")
+                            time.sleep(0.5)
+                            # Handle any blocking radio modals
+                            radio_hr = self.handlers.handle_radio_brute_force(page, step_number)
+                            if radio_hr.success:
+                                logger.info("Step %d: radio modal resolved after iframe code", step_number)
+                            # Hide remaining modals
+                            _hide_stuck_modals(page)
+                            time.sleep(1.0)
+                            if check_progress(page.url, step_number):
+                                result.success = True
+                                result.code_found = code
+                                logger.info("Step %d: iframe code accepted after modal handling", step_number)
+                                break
+                            # DOM check as fallback
+                            dom_step = page.evaluate("""() => {
+                                const t = document.body.textContent || '';
+                                const m = t.match(/Step\\s+(\\d+)\\s+of\\s+30/);
+                                return m ? parseInt(m[1]) : 0;
+                            }""")
+                            if dom_step > step_number:
+                                result.success = True
+                                result.code_found = code
+                                logger.info("Step %d: iframe code accepted (DOM shows step %d)", step_number, dom_step)
+                                break
                         failed_codes.append(code)
                     if result.success:
                         break

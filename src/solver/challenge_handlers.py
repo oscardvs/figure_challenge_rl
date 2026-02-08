@@ -1613,29 +1613,77 @@ class ChallengeHandlers:
         codes: list[str] = []
         log: list[str] = []
         extract_attempts = 0
+        deepest_click_attempts = 0
         last_clicked_level = -1
         level_div_stuck_count = 0
         prev_current = -1
-        for click_round in range(15):
-            # Dismiss overlays/popups every round so they don't block clicks
+        for click_round in range(20):
+            # Dismiss ALL overlays/popups every round — click close buttons
+            # first (updates React state), then CSS-hide remaining overlays.
             page.evaluate("""\
 (() => {
     const hide = el => { el.style.display='none'; el.style.pointerEvents='none'; el.style.visibility='hidden'; el.style.zIndex='-1'; };
-    document.querySelectorAll('.fixed, [class*="absolute"]').forEach(el => {
-        const t = el.textContent || '';
-        if (t.includes('Wrong Button') || t.includes('Try Again')) {
-            const btn = el.querySelector('button'); if (btn) btn.click();
-            hide(el);
-        }
+    // Step 1: Find ALL fixed/absolute overlays with high z-index
+    const overlays = [];
+    document.querySelectorAll('.fixed, [class*="absolute"], [style*="position: fixed"], [style*="position:fixed"]').forEach(el => {
+        const s = getComputedStyle(el);
+        const z = parseInt(s.zIndex) || 0;
+        const r = el.getBoundingClientRect();
+        if (r.width < 50 || r.height < 50) return;
+        const t = (el.textContent || '').trim();
+        // Skip challenge-essential elements
+        if (t.includes('Step') && t.includes('of 30')) return;
+        if (el.querySelector('input[type="text"]')) return;
+        if (t.includes('Iframe Challenge') || t.includes('Recursive Iframe')) return;
+        // Skip level navigation divs
+        if (t.includes('Enter Level') && t.includes('border')) return;
+        overlays.push({el, z, t: t.substring(0, 100)});
     });
-    // Make backdrop overlays click-through
-    document.querySelectorAll('.fixed').forEach(el => {
-        if ((el.className||'').includes('bg-black') || (el.style.backgroundColor||'').includes('rgba(0')) {
-            if (!el.textContent.includes('Step') && !el.querySelector('input')) {
+    // Step 2: Click close/dismiss buttons on popup overlays
+    let dismissed = 0;
+    for (const {el, z, t} of overlays) {
+        // Known popup patterns (decoy popups at deepest iframe level)
+        const isPopup = t.includes('Wrong Button') || t.includes('Try Again')
+            || t.includes('Important Notice') || t.includes('Overlay Notice')
+            || t.includes('amazing deals') || t.includes('won a prize')
+            || t.includes('Congratulations') || t.includes('Special Offer')
+            || t.includes('Act Now') || t.includes('Limited Time')
+            || t.includes('Click here for') || t.includes('Subscribe')
+            || (z >= 9000 && !t.includes('Level') && !t.includes('Extract')
+                && !t.includes('Enter Code') && !t.includes('Submit'));
+        if (!isPopup) continue;
+        // Click close/dismiss buttons within the popup
+        const closeBtns = el.querySelectorAll('button, [role="button"], .cursor-pointer');
+        for (const btn of closeBtns) {
+            const bt = (btn.textContent || '').trim().toLowerCase();
+            if (bt.includes('close') || bt.includes('dismiss') || bt.includes('x')
+                || bt.includes('no thanks') || bt.includes('cancel')
+                || bt.includes('got it') || bt === 'x' || bt === '\u00d7'
+                || bt === '\u2715' || bt === '\u2716') {
+                try { btn.click(); dismissed++; } catch(e) {}
+            }
+        }
+        // Also try the last button (often the dismiss action)
+        if (closeBtns.length > 0) {
+            try { closeBtns[closeBtns.length - 1].click(); dismissed++; } catch(e) {}
+        }
+        // CSS-hide the popup regardless
+        hide(el);
+    }
+    // Step 3: Make ALL dark backdrop overlays click-through
+    document.querySelectorAll('.fixed, [style*="position: fixed"]').forEach(el => {
+        const cls = el.className || '';
+        const bg = el.style.backgroundColor || '';
+        if (cls.includes('bg-black') || bg.includes('rgba(0') || cls.includes('bg-opacity')
+            || cls.includes('bg-gray-900') || cls.includes('backdrop')) {
+            if (!(el.textContent||'').includes('Step') && !el.querySelector('input')) {
                 el.style.pointerEvents = 'none';
+                el.style.opacity = '0';
+                el.style.zIndex = '-1';
             }
         }
     });
+    return dismissed;
 })()""")
             page.evaluate("""\
 (() => {
@@ -1683,7 +1731,8 @@ class ChallengeHandlers:
         if (t.includes('go deeper') || t.includes('next level') || t.includes('descend')) enterBtns.push({level: current + 1, text: t});
         if (t.includes('extract') || t.includes('get code')) extractBtn = true;
     }
-    const atDeepest = text.includes('deepest level') || text.includes('reached the deepest');
+    const atDeepest = text.includes('reached the deepest') || text.includes("You've reached")
+        || text.includes('You have reached the deepest');
     return {current, total, levelDivs, enterBtns, extractBtn, atDeepest};
 })()""")
             if not result:
@@ -1701,19 +1750,21 @@ class ChallengeHandlers:
                         result.get("levelDivs"), result.get("enterBtns"),
                         result.get("extractBtn"), result.get("atDeepest"))
 
-            # PRIORITY 1: Click incomplete level divs (but NOT when already
-            # at deepest — clicking Level N div there just wastes rounds)
+            # PRIORITY 1: Click incomplete level divs.
+            # At deepest level, try once to click the deepest div (may need
+            # activation), then move to Extract Code.
             level_divs = result.get("levelDivs", [])
             incomplete = [d for d in level_divs if not d.get("complete")]
-            at_deepest = result.get("atDeepest") or current >= total - 1
-            if incomplete and level_div_stuck_count < 3 and not at_deepest:
+            at_deepest = result.get("atDeepest") or (total > 0 and current >= total)
+            max_stuck = 1 if at_deepest else 3
+            if incomplete and level_div_stuck_count < max_stuck:
                 incomplete.sort(key=lambda d: d["level"])
                 target = incomplete[0]
                 if target["level"] == last_clicked_level and current == prev_current:
                     level_div_stuck_count += 1
                 else:
                     level_div_stuck_count = 0
-                if level_div_stuck_count < 3:
+                if level_div_stuck_count < max_stuck:
                     # Try Playwright locator click (native browser events)
                     try:
                         loc = page.locator(f"div[class*='border-2'][class*='rounded']").filter(
@@ -1774,21 +1825,64 @@ class ChallengeHandlers:
                     continue
 
             # At deepest level: try to complete the deepest level div via
-            # various interactions before trying Extract Code
-            if incomplete and at_deepest and extract_attempts == 0:
+            # single click + JS click + mouse click (React onClick doesn't
+            # fire on dblclick, so we use single click methods instead)
+            if incomplete and at_deepest and deepest_click_attempts < 3:
+                deepest_click_attempts += 1
                 target = incomplete[0]
-                # Try Playwright double-click on the level div
+                logger.info("Iframe: deepest level %d click attempt %d/3", target['level'], deepest_click_attempts)
+                # Method 1: Playwright single click
                 try:
                     loc = page.locator(f"div[class*='border-2'][class*='rounded']").filter(
                         has_text=f"Level {target['level']}"
                     )
                     if loc.count() > 0:
                         loc.first.scroll_into_view_if_needed(timeout=2000)
-                        loc.first.dblclick(timeout=2000)
-                        log.append(f"iframe: dblclicked level {target['level']}")
+                        loc.first.click(timeout=2000)
+                        log.append(f"iframe: clicked level {target['level']} (deepest attempt {deepest_click_attempts})")
                 except Exception:
                     pass
-                time.sleep(0.3)
+                # Method 2: JS click + React event dispatch
+                page.evaluate(f"""\
+(() => {{
+    for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {{
+        const t = (div.childNodes[0]?.textContent || '').trim();
+        if (t.includes('Level {target["level"]}') && !t.includes('\u2713') && !t.includes('\u2714')) {{
+            div.scrollIntoView({{behavior: 'instant', block: 'center'}});
+            div.click();
+            div.dispatchEvent(new MouseEvent('click', {{bubbles:true, cancelable:true, view:window}}));
+            // Also invoke React onClick via fiber
+            const fk = Object.keys(div).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactProps$'));
+            if (fk) {{
+                const obj = div[fk];
+                const onClick = obj.onClick || obj.memoizedProps?.onClick || obj.pendingProps?.onClick;
+                if (typeof onClick === 'function') {{
+                    try {{ onClick({{preventDefault:()=>{{}},stopPropagation:()=>{{}},target:div,currentTarget:div}}); }} catch(e) {{}}
+                }}
+            }}
+            return true;
+        }}
+    }}
+    return false;
+}})()""")
+                # Method 3: Mouse click at coordinates
+                try:
+                    rect = page.evaluate(f"""\
+(() => {{
+    for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {{
+        const t = (div.childNodes[0]?.textContent || '').trim();
+        if (t.includes('Level {target["level"]}') && !t.includes('\u2713') && !t.includes('\u2714')) {{
+            const r = div.getBoundingClientRect();
+            return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2)}};
+        }}
+    }}
+    return null;
+}})()""")
+                    if rect:
+                        page.mouse.click(rect["x"], rect["y"])
+                except Exception:
+                    pass
+                time.sleep(0.5)
 
             # PRIORITY 3: At deepest level — catch the moving button
             # Debug: on first extract attempt, dump the DOM structure
@@ -1839,128 +1933,99 @@ class ChallengeHandlers:
             if at_deepest and (result.get("extractBtn") or extract_attempts > 0):
                 extract_attempts += 1
 
-                # First try: look for animated/moving elements (the REAL Extract Code)
-                # The static "Extract Code" button is a decoy — there's a moving button
-                # that orbits the browser window edges.
-                anim_count = page.evaluate("""\
+                # Skip animated button detection — they're ALL decoys at the
+                # deepest level (trap buttons like "Next Step", "Click Here!",
+                # "Continue").  Go straight to Extract Code.
+
+                # On first attempt, hide all animated decoys so they don't
+                # intercept clicks on Extract Code.
+                if extract_attempts == 1:
+                    hidden = page.evaluate("""\
 (() => {
     let count = 0;
+    const hide = el => { el.style.display='none'; el.style.pointerEvents='none'; el.style.visibility='hidden'; el.style.zIndex='-1'; };
     document.querySelectorAll('*').forEach(el => {
-        const style = getComputedStyle(el);
+        const s = getComputedStyle(el);
         const cls = el.getAttribute('class') || '';
-        const hasAnimation = (style.animation && style.animation !== 'none' &&
-            style.animationName !== 'none') ||
-            cls.includes('animate-[move') || cls.includes('animate-[bounce') ||
-            cls.includes('animate-') ||
-            style.transition.includes('transform') || style.transition.includes('left') ||
-            style.transition.includes('top');
+        const hasAnim = (s.animation && s.animation !== 'none' && s.animationName !== 'none') ||
+            cls.includes('animate-');
         const r = el.getBoundingClientRect();
         const isSmall = r.width > 10 && r.width < 300 && r.height > 10 && r.height < 200;
-        const isClickable = style.cursor === 'pointer' || cls.includes('cursor-pointer') ||
-            el.tagName === 'BUTTON' || cls.includes('pointer-events-auto');
-        // Fixed-position elements have offsetParent=null, use getBoundingClientRect instead
-        const isVisible = el.offsetParent !== null || style.position === 'fixed';
-        if (hasAnimation && isSmall && isClickable && isVisible) {
-            el.setAttribute('data-iframe-anim', String(count++));
+        const t = (el.textContent||'').trim().toLowerCase();
+        if (hasAnim && isSmall && !t.includes('extract') && !t.includes('get code')) {
+            hide(el); count++;
+        }
+    });
+    // Dismiss ALL popup overlays — click close buttons, then CSS-hide
+    document.querySelectorAll('.fixed, [class*="absolute"], [style*="position: fixed"], [style*="position:fixed"]').forEach(el => {
+        const t = (el.textContent||'').trim();
+        const r = el.getBoundingClientRect();
+        if (r.width < 30 || r.height < 30) return;
+        // Skip challenge-essential elements
+        if ((t.includes('Step') && t.includes('of 30')) || el.querySelector('input[type="text"]')) return;
+        if (t.includes('Iframe Challenge') || t.includes('Recursive Iframe')) return;
+        if (t.includes('Extract Code') || t.includes('Get Code')) return;
+        if (t.includes('Enter Level') && el.querySelector('[class*="border-2"]')) return;
+        // Click close/dismiss buttons first (updates React state)
+        const btns = el.querySelectorAll('button, [role="button"]');
+        for (const btn of btns) {
+            const bt = (btn.textContent||'').trim().toLowerCase();
+            if (bt.includes('close') || bt.includes('dismiss') || bt === 'x'
+                || bt === '\u00d7' || bt === '\u2715' || bt.includes('no thanks')
+                || bt.includes('cancel') || bt.includes('got it') || bt.includes('ok')) {
+                try { btn.click(); count++; } catch(e) {}
+            }
+        }
+        hide(el);
+    });
+    // Also hide high-z-index floating decoys by text pattern
+    document.querySelectorAll('div, a, span').forEach(el => {
+        const s = getComputedStyle(el);
+        if ((s.position === 'absolute' || s.position === 'fixed') && parseInt(s.zIndex) > 10) {
+            const t = (el.textContent||'').trim();
+            const decoyTexts = ['Click Here!','Try This!','Button!','Link!','Click Me!','Here!',
+                'Moving!','Next Step','Continue','Move On','Important Notice','amazing deals',
+                'won a prize','Congratulations','Special Offer','Act Now'];
+            for (const d of decoyTexts) { if (t.includes(d)) { hide(el); break; } }
         }
     });
     return count;
 })()""")
-                if anim_count > 0:
-                    logger.info("Iframe: found %d animated elements at depth %d/%d", anim_count, current, total)
-                    for i in range(anim_count):
-                        # Freeze element at center and click it
-                        info = page.evaluate(f"""\
-(() => {{
-    const el = document.querySelector('[data-iframe-anim="{i}"]');
-    if (!el || el.style.display === 'none') return null;
-    el.style.animation = 'none';
-    el.style.transition = 'none';
-    el.style.position = 'fixed';
-    el.style.top = '50%';
-    el.style.left = '50%';
-    el.style.zIndex = '99999';
-    el.style.transform = 'translate(-50%, -50%)';
-    el.style.pointerEvents = 'auto';
-    const r = el.getBoundingClientRect();
-    return {{x: Math.round(r.x + r.width/2), y: Math.round(r.y + r.height/2),
-        text: (el.textContent || '').trim().substring(0, 60),
-        tag: el.tagName}};
-}})()""")
-                        if not info:
-                            continue
-                        logger.info("Iframe: clicking frozen anim element %d: %s", i, info)
-                        try:
-                            page.mouse.click(info["x"], info["y"])
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
-                        # Check if code appeared
-                        found_code = page.evaluate("""\
-(() => {
-    const text = document.body.textContent || '';
-    const patterns = [
-        /(?:code|Code)[^:]*?:\\s*([A-Z0-9]{6})/,
-        /(?:extracted|revealed|unlocked)[^.]*?\\b([A-Z0-9]{6})\\b/i,
-    ];
-    for (const p of patterns) { const m = text.match(p); if (m) return m[1].toUpperCase(); }
-    for (const el of document.querySelectorAll('.text-green-600, .text-green-500, .bg-green-100, .text-emerald-600')) {
-        const m = (el.textContent || '').match(/\\b([A-Z0-9]{6})\\b/);
-        if (m) return m[1];
-    }
-    return null;
-})()""")
-                        if found_code and not is_false_positive(found_code):
-                            logger.info("Iframe: animated button revealed code: %s", found_code)
-                            codes.append(found_code)
-                            return HandlerResult(codes_found=codes, actions_log=log, success=True)
-                        # Also check via fiber
-                        fiber_codes = page.evaluate("""\
-(() => {
-    const codes = new Set();
-    function sf(fiber, d) {
-        if (!fiber || d > 30) return;
-        let state = fiber.memoizedState;
-        for (let i = 0; i < 20 && state; i++) {
-            const val = state.memoizedState;
-            if (typeof val === 'string') {
-                const m = val.match(/^[A-Z0-9]{6}$/);
-                if (m && !['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED'].includes(m[0])) codes.add(m[0]);
-            }
-            state = state.next;
-        }
-        if (fiber.child) sf(fiber.child, d+1);
-        if (fiber.sibling) sf(fiber.sibling, d+1);
-    }
-    const root = document.querySelector('#root');
-    const key = Object.keys(root).find(k => k.startsWith('__reactFiber'));
-    if (key) sf(root[key], 0);
-    return [...codes];
-})()""")
-                        if fiber_codes:
-                            logger.info("Iframe: fiber codes after anim click: %s", fiber_codes)
-                            codes.extend(fiber_codes)
-                            return HandlerResult(codes_found=codes, actions_log=log, success=True)
-                        # Hide this animated element so next one is exposed
-                        page.evaluate(f"""\
-(() => {{
-    const el = document.querySelector('[data-iframe-anim="{i}"]');
-    if (el) {{ el.style.display = 'none'; el.style.pointerEvents = 'none'; }}
-}})()""")
-                    # Clean up tags
-                    page.evaluate("document.querySelectorAll('[data-iframe-anim]').forEach(el => el.removeAttribute('data-iframe-anim'))")
-                    log.append(f"iframe: tried {anim_count} animated buttons ({current}/{total})")
-                    time.sleep(0.5)
-                    continue
+                    logger.info("Iframe: hid %d animated decoys at deepest level", hidden)
+                    time.sleep(0.3)
 
-                if extract_attempts > 6:
-                    # Fiber search as last resort
+                    # Try interacting with elements INSIDE the deepest level div
+                    # to trigger completion (click buttons, links, spans within it)
+                    inner_clicks = page.evaluate("""\
+(() => {
+    const clicks = [];
+    for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {
+        const t = (div.childNodes[0]?.textContent || '').trim();
+        if (!t.includes('Level') || t.includes('\u2713') || t.includes('\u2714')) continue;
+        // Click all interactive children inside this level div
+        const children = div.querySelectorAll('button, a, [role="button"], [onclick], [class*="cursor-pointer"]');
+        for (const child of children) {
+            const ct = (child.textContent||'').trim();
+            if (ct.toLowerCase().includes('extract') || ct.toLowerCase().includes('get code')) continue;
+            try { child.click(); clicks.push(ct.substring(0, 30)); } catch(e) {}
+        }
+        // Also click the div itself
+        try { div.click(); clicks.push('div-self'); } catch(e) {}
+    }
+    return clicks;
+})()""")
+                    if inner_clicks:
+                        logger.info("Iframe: clicked %d inner elements: %s", len(inner_clicks), inner_clicks[:5])
+                    time.sleep(0.5)
+
+                if extract_attempts > 8:
+                    # Fiber search as fallback after 8 extract attempts
                     fiber_code = page.evaluate("""\
 (() => {
     const codes = new Set();
-    const fp = new Set(['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED','DWRONG','EWRONG','FWRONG','GWRONG','HWRONG','METHIS','REGIST']);
+    const fp = new Set(['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED','DWRONG','EWRONG','FWRONG','GWRONG','HWRONG','METHIS','REGIST','PAGEGO']);
     function searchFiber(fiber, depth) {
-        if (!fiber || depth > 30) return;
+        if (!fiber || depth > 50) return;
         let state = fiber.memoizedState;
         for (let i = 0; i < 20 && state; i++) {
             const val = state.memoizedState;
@@ -1991,7 +2056,7 @@ class ChallengeHandlers:
         if (fiber.sibling) searchFiber(fiber.sibling, depth + 1);
     }
     const root = document.querySelector('#root');
-    const key = Object.keys(root).find(k => k.startsWith('__reactFiber$'));
+    const key = Object.keys(root).find(k => k.startsWith('__reactFiber$') || k.startsWith('__reactContainer$'));
     if (key) searchFiber(root[key], 0);
     return [...codes];
 })()""")
@@ -2002,8 +2067,8 @@ class ChallengeHandlers:
                     logger.info("Iframe: Extract clicked %dx + no animated/fiber codes, bailing", extract_attempts)
                     break
 
-                # After 4 extract attempts, try React dispatch to force level completion
-                if extract_attempts == 4:
+                # After 3 extract attempts, try React dispatch to force level completion
+                if extract_attempts == 3:
                     logger.info("Iframe: trying React dispatch to force deepest level completion")
                     page.evaluate("""\
 (() => {
@@ -2053,10 +2118,144 @@ class ChallengeHandlers:
 })()""")
                     time.sleep(1.0)
 
+                # Force-complete the deepest level via React fiber if it's still
+                # incomplete — the Extract Code button checks this state.
+                if incomplete:
+                    page.evaluate("""\
+(() => {
+    function getFiber(el) {
+        for (const k of Object.keys(el)) {
+            if (k.startsWith('__reactFiber$') || k.startsWith('__reactInternalInstance$'))
+                return el[k];
+        }
+        return null;
+    }
+    // Find all incomplete level divs and force-complete them
+    for (const div of document.querySelectorAll('div[class*="border-2"][class*="rounded"]')) {
+        const t = (div.childNodes[0]?.textContent || '').trim();
+        if (!t.includes('Level') || t.includes('\u2713') || t.includes('\u2714')) continue;
+        // Click it natively first
+        div.click();
+        // Then walk the React fiber to flip boolean state hooks
+        const fiber = getFiber(div);
+        if (!fiber) continue;
+        let node = fiber;
+        for (let i = 0; i < 25 && node; i++) {
+            if (node.memoizedState && typeof node.memoizedState === 'object' && node.memoizedState.queue !== undefined) {
+                let hook = node.memoizedState;
+                for (let h = 0; h < 20 && hook; h++) {
+                    if (typeof hook.memoizedState === 'boolean' && hook.memoizedState === false
+                        && hook.queue && hook.queue.dispatch) {
+                        try { hook.queue.dispatch(true); } catch(e) {}
+                    }
+                    hook = hook.next;
+                }
+            }
+            node = node.return;
+        }
+    }
+})()""")
+                    time.sleep(0.5)
+
+                # Aggressively dismiss ALL popups and overlays before Extract
+                # Code — click Close buttons first (to update React state),
+                # then CSS-hide everything blocking the Extract Code button.
+                dismissed = page.evaluate("""\
+(() => {
+    const hide = el => { el.style.display='none'; el.style.pointerEvents='none'; el.style.visibility='hidden'; el.style.zIndex='-1'; };
+    let dismissed = 0;
+    // Hide elements we froze at center
+    document.querySelectorAll('[data-iframe-anim]').forEach(el => hide(el));
+    // Find and dismiss ALL popup overlays by clicking their close buttons
+    const allPositioned = document.querySelectorAll('.fixed, [class*="absolute"], [style*="position: fixed"], [style*="position:fixed"]');
+    for (const el of allPositioned) {
+        const t = (el.textContent || '').trim();
+        const s = getComputedStyle(el);
+        const z = parseInt(s.zIndex) || 0;
+        const r = el.getBoundingClientRect();
+        // Skip tiny/invisible elements
+        if (r.width < 30 || r.height < 30) continue;
+        // Skip challenge-essential elements
+        if (t.includes('Step') && t.includes('of 30')) continue;
+        if (el.querySelector('input[type="text"]')) continue;
+        if (t.includes('Iframe Challenge') || t.includes('Recursive Iframe')) continue;
+        if (t.includes('Extract Code') || t.includes('Get Code')) continue;
+        // Skip level navigation content
+        if (t.includes('Enter Level') && el.querySelector('[class*="border-2"]')) continue;
+        // This is a popup/overlay — try clicking close buttons
+        const btns = el.querySelectorAll('button, [role="button"], .cursor-pointer');
+        for (const btn of btns) {
+            const bt = (btn.textContent || '').trim().toLowerCase();
+            if (bt.includes('close') || bt.includes('dismiss') || bt === 'x'
+                || bt === '\u00d7' || bt === '\u2715' || bt === '\u2716'
+                || bt.includes('no thanks') || bt.includes('cancel')
+                || bt.includes('got it') || bt.includes('ok')) {
+                try { btn.click(); dismissed++; } catch(e) {}
+            }
+        }
+        // CSS-hide it
+        hide(el);
+        dismissed++;
+    }
+    // Also hide ALL high-z-index elements that could block clicks
+    document.querySelectorAll('*').forEach(el => {
+        const s = getComputedStyle(el);
+        const z = parseInt(s.zIndex) || 0;
+        if (z >= 100 && (s.position === 'fixed' || s.position === 'absolute')) {
+            const t = (el.textContent || '').trim();
+            if (!t.includes('Step') && !t.includes('Extract') && !t.includes('Get Code')
+                && !t.includes('Enter Code') && !t.includes('Submit')
+                && !el.querySelector('input[type="text"]')) {
+                hide(el);
+            }
+        }
+    });
+    // Hide floating decoy elements by text pattern
+    document.querySelectorAll('div, a, span, button').forEach(el => {
+        const s = getComputedStyle(el);
+        if (s.position === 'absolute' || s.position === 'fixed') {
+            const t = (el.textContent||'').trim();
+            const decoyTexts = ['Click Here!','Try This!','Button!','Link!','Click Me!','Here!',
+                'Moving!','Next Step','Continue','Move On','Go Forward','Keep Going',
+                'Important Notice','amazing deals','won a prize','Congratulations',
+                'Special Offer','Act Now','Limited Time','Subscribe'];
+            for (const d of decoyTexts) {
+                if (t.includes(d)) { hide(el); break; }
+            }
+        }
+    });
+    return dismissed;
+})()""")
+                if dismissed:
+                    logger.info("Iframe: dismissed %d popups/overlays before Extract Code", dismissed)
+                time.sleep(0.3)
+
+                # Fix pointer-events on the Extract Code button's ancestor chain
+                # Parent containers may have pointer-events:none that blocks clicks
+                page.evaluate("""\
+(() => {
+    for (const btn of document.querySelectorAll('button')) {
+        const t = btn.textContent.trim().toLowerCase();
+        if (!t.includes('extract') && !t.includes('get code')) continue;
+        // Walk up the DOM tree and ensure pointer-events is enabled
+        let el = btn;
+        while (el && el !== document.body) {
+            const s = getComputedStyle(el);
+            if (s.pointerEvents === 'none') {
+                el.style.pointerEvents = 'auto';
+            }
+            el = el.parentElement;
+        }
+        return true;
+    }
+    return false;
+})()""")
+
                 # Try clicking Extract Code with multiple methods:
-                # 1) Playwright locator click (native browser events)
-                # 2) page.mouse.click at exact coordinates
-                # 3) JS click as fallback
+                # 1) React fiber onClick invocation
+                # 2) JS click + dispatchEvent
+                # 3) Playwright locator click (native browser events)
+                # 4) page.mouse.click at exact coordinates
                 btn_rect = page.evaluate("""\
 (() => {
     for (const btn of document.querySelectorAll('button')) {
@@ -2073,19 +2272,54 @@ class ChallengeHandlers:
     return null;
 })()""")
                 if btn_rect:
+                    # Method 1: Direct React onClick handler invocation via fiber
+                    # Walk up the fiber tree to find onClick (may be on a parent)
+                    page.evaluate("""\
+(() => {
+    for (const btn of document.querySelectorAll('button')) {
+        const t = btn.textContent.trim().toLowerCase();
+        if (!t.includes('extract') && !t.includes('get code')) continue;
+        const syntheticEvent = {preventDefault:()=>{},stopPropagation:()=>{},
+            target:btn, currentTarget:btn, nativeEvent:new MouseEvent('click')};
+        // Try __reactProps$ first (direct props on DOM node)
+        const pk = Object.keys(btn).find(k => k.startsWith('__reactProps$'));
+        if (pk && typeof btn[pk]?.onClick === 'function') {
+            try { btn[pk].onClick(syntheticEvent); } catch(e) {}
+        }
+        // Walk up the fiber tree to find onClick handler
+        const fk = Object.keys(btn).find(k => k.startsWith('__reactFiber$'));
+        if (fk) {
+            let fiber = btn[fk];
+            for (let i = 0; i < 15 && fiber; i++) {
+                const props = fiber.memoizedProps || fiber.pendingProps;
+                if (props && typeof props.onClick === 'function') {
+                    try { props.onClick(syntheticEvent); } catch(e) {}
+                    break;
+                }
+                fiber = fiber.return;
+            }
+        }
+        // Also try standard click
+        btn.click();
+        // Also try dispatchEvent with full MouseEvent
+        try {
+            btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+        } catch(e) {}
+        return;
+    }
+})()""")
+                    time.sleep(0.5)
                     try:
-                        # Hover first, then click at exact coordinates
-                        page.mouse.move(btn_rect["x"], btn_rect["y"])
-                        time.sleep(0.2)
+                        # Method 2: mouse click at coordinates
                         page.mouse.click(btn_rect["x"], btn_rect["y"])
-                        log.append(f"iframe: mouse-clicked extract at ({btn_rect['x']},{btn_rect['y']})")
+                        log.append(f"iframe: clicked extract at ({btn_rect['x']},{btn_rect['y']})")
                     except Exception:
                         pass
-                    # Also try Playwright locator
+                    # Method 3: Playwright locator
                     try:
                         loc = page.locator("button").filter(has_text="Extract Code")
                         if loc.count() > 0:
-                            loc.first.click(timeout=2000)
+                            loc.first.click(timeout=2000, force=True)
                     except Exception:
                         pass
                 else:
@@ -2104,8 +2338,7 @@ class ChallengeHandlers:
 
                 # Post-click analysis: check what changed
                 time.sleep(1.0)
-                if extract_attempts <= 2:
-                    post_click = page.evaluate("""\
+                post_click = page.evaluate("""\
 (() => {
     const info = {};
     // Check the dashed-border container for any code
@@ -2117,8 +2350,38 @@ class ChallengeHandlers:
         const t = (div.childNodes[0]?.textContent || '').trim();
         if (t.includes('Level') && !t.includes('\u2713') && !t.includes('\u2714')) {
             info.levelHtml = div.innerHTML.substring(0, 500);
+            info.levelComplete = false;
+        }
+        if (t.includes('Level') && (t.includes('\u2713') || t.includes('\u2714'))) {
+            info.lastCompleteLevel = t.substring(0, 40);
         }
     }
+    if (!info.hasOwnProperty('levelComplete')) info.levelComplete = true;
+    // Check ALL elements with green/success styling for revealed codes
+    info.greenText = [];
+    for (const el of document.querySelectorAll('[class*="green"], [class*="emerald"], [class*="success"]')) {
+        const t = (el.textContent||'').trim();
+        if (t.length > 0 && t.length < 200) info.greenText.push(t.substring(0, 100));
+    }
+    // Check data attributes for hidden codes
+    info.dataAttrs = [];
+    document.querySelectorAll('[data-code], [data-secret], [data-value]').forEach(el => {
+        for (const attr of ['data-code', 'data-secret', 'data-value']) {
+            const v = el.getAttribute(attr);
+            if (v) info.dataAttrs.push(v);
+        }
+    });
+    // Check aria-labels
+    document.querySelectorAll('[aria-label]').forEach(el => {
+        const v = el.getAttribute('aria-label') || '';
+        const m = v.match(/\\b[A-Z0-9]{6}\\b/);
+        if (m) { if (!info.ariaCode) info.ariaCode = []; info.ariaCode.push(m[0]); }
+    });
+    // Check for ANY 6-char code anywhere
+    const allText = document.body.textContent || '';
+    const allCodes = [...(allText.match(/\\b[A-Z0-9]{6}\\b/g) || [])];
+    const fp = new Set(['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED','DWRONG','EWRONG','FWRONG','GWRONG','HWRONG','METHIS','REGIST','BUTTON','SUBMIT','TOGGLE']);
+    info.allCodes = allCodes.filter(c => !fp.has(c) && !c.endsWith('WRONG')).slice(0, 10);
     // Check Extract Code button's React fiber for state
     for (const btn of document.querySelectorAll('button')) {
         if (!(btn.textContent||'').toLowerCase().includes('extract')) continue;
@@ -2135,7 +2398,7 @@ class ChallengeHandlers:
                     const type = typeof ms;
                     if (type === 'string' || type === 'number' || type === 'boolean') hookVals.push(ms);
                     else if (Array.isArray(ms)) hookVals.push('[array:' + ms.length + ']');
-                    else if (type === 'object') hookVals.push(JSON.stringify(ms).substring(0, 100));
+                    else if (type === 'object') { try { hookVals.push(JSON.stringify(ms).substring(0, 100)); } catch(e) { hookVals.push('[object]'); } }
                 }
                 hook = hook.next;
             }
@@ -2144,14 +2407,82 @@ class ChallengeHandlers:
         }
         break;
     }
-    // Check for ANY 6-char code anywhere
-    const allText = document.body.textContent || '';
-    const allCodes = [...(allText.match(/\\b[A-Z0-9]{6}\\b/g) || [])];
-    const fp = new Set(['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED','DWRONG','EWRONG','FWRONG','GWRONG','HWRONG','METHIS','REGIST']);
-    info.allCodes = allCodes.filter(c => !fp.has(c) && !c.endsWith('WRONG')).slice(0, 10);
     return info;
 })()""")
-                    logger.debug("Iframe: post-click analysis (attempt %d): %s", extract_attempts, post_click)
+                logger.info("Iframe: post-extract analysis (attempt %d): %s", extract_attempts, post_click)
+
+                # Extract codes from fiberState if present
+                if post_click and post_click.get("fiberState"):
+                    import re as _re
+                    _fp_set = {'IFRAME','BWRONG','1WRONG','CWRONG','STEPGO','WORKER','LOADED',
+                               'DWRONG','EWRONG','FWRONG','GWRONG','HWRONG','METHIS','REGIST',
+                               'BUTTON','SUBMIT','TOGGLE','PAGEGO'}
+                    for fs_entry in post_click["fiberState"]:
+                        for v in fs_entry.get("vals", []):
+                            if isinstance(v, str) and _re.match(r'^[A-Z0-9]{6}$', v) and v not in _fp_set and not v.endswith('WRONG'):
+                                logger.info("Iframe: found code %s in fiberState at depth %d", v, fs_entry.get("depth", -1))
+                                codes.append(v)
+                    if codes:
+                        # Try direct submission from within the handler — the
+                        # caller's fill_and_submit may fail due to overlays.
+                        url_before = page.url
+                        for fiber_code in codes:
+                            submitted = page.evaluate(f"""\
+(() => {{
+    const code = '{fiber_code}';
+    const inp = document.querySelector('input[placeholder*="code" i], input[type="text"]');
+    if (!inp) return {{error: 'no input'}};
+    // React-compatible value setting
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+    setter.call(inp, code);
+    inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+    inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+    // Try clicking Submit Code button
+    let clicked = false;
+    for (const btn of document.querySelectorAll('button')) {{
+        const t = (btn.textContent || '').trim();
+        if ((t === 'Submit' || t === 'Submit Code') && !btn.disabled) {{
+            btn.click(); clicked = true; break;
+        }}
+    }}
+    // Also check near the input
+    if (!clicked) {{
+        let container = inp.parentElement;
+        for (let i = 0; i < 6 && container; i++) {{
+            for (const btn of container.querySelectorAll('button')) {{
+                const t = (btn.textContent || '').trim();
+                if (t.includes('Submit') && !btn.disabled) {{
+                    btn.click(); clicked = true; break;
+                }}
+            }}
+            if (clicked) break;
+            container = container.parentElement;
+        }}
+    }}
+    return {{filled: true, clicked, val: inp.value, disabled: document.querySelector('button[disabled]')?.textContent?.trim()}};
+}})()""")
+                            logger.info("Iframe: direct submit result for '%s': %s", fiber_code, submitted)
+                            time.sleep(0.5)
+                            # Also try Enter key
+                            try:
+                                page.keyboard.press("Enter")
+                            except Exception:
+                                pass
+                            time.sleep(1.0)
+                            if page.url != url_before:
+                                logger.info("Iframe: code '%s' accepted (URL changed)", fiber_code)
+                                return HandlerResult(codes_found=codes, actions_log=log, success=True)
+                        return HandlerResult(codes_found=codes, actions_log=log, success=True)
+
+                # Take a screenshot on 3rd failed attempt for visual debugging
+                if extract_attempts == 3:
+                    try:
+                        ss_path = f"/tmp/iframe_deepest_step{current}_{int(time.time())}.png"
+                        page.screenshot(path=ss_path)
+                        logger.info("Iframe: screenshot saved to %s", ss_path)
+                    except Exception as e:
+                        logger.debug("Iframe: screenshot failed: %s", e)
+
                 time.sleep(0.5)
                 continue
             logger.info("Iframe: nothing to click (round %d, %d/%d)", click_round, current, total)
