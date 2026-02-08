@@ -18,7 +18,6 @@ from dataclasses import dataclass, field
 from src.solver.challenge_detector import ChallengeDetector, ChallengeType
 from src.solver.challenge_handlers import (
     ChallengeHandlers,
-    FALSE_POSITIVES,
     _try_trap_buttons,
     check_progress,
     clear_popups,
@@ -26,6 +25,7 @@ from src.solver.challenge_handlers import (
     extract_hidden_codes,
     fill_and_submit,
     force_reset_puzzle,
+    is_false_positive,
     sort_codes_by_priority,
 )
 
@@ -392,7 +392,7 @@ class DeterministicSolver:
     }
     return null;
 })()""")
-                    if revealed and revealed not in FALSE_POSITIVES and revealed not in failed_codes:
+                    if revealed and not is_false_positive(revealed) and revealed not in failed_codes:
                         logger.info("Step %d: audio revealed code: %s", step_number, revealed)
                         ok, submit_is_trap = fill_and_submit(page, revealed, step_number, submit_is_trap)
                         if ok:
@@ -632,7 +632,7 @@ class DeterministicSolver:
                     ))
                     all_to_try = [c for c in all_to_try
                                   if c not in stale_set
-                                  and c not in FALSE_POSITIVES
+                                  and not is_false_positive(c)
                                   and re.fullmatch(r"[A-Z0-9]{6}", c)]
                     logger.info("Step %d: trap submit — trying %d codes with animated buttons",
                                 step_number, len(all_to_try[:10]))
@@ -958,7 +958,7 @@ class DeterministicSolver:
     }
     return null;
 })()""")
-                if revealed and revealed not in FALSE_POSITIVES and revealed not in failed_codes:
+                if revealed and not is_false_positive(revealed) and revealed not in failed_codes:
                     logger.info("Step %d: audio revealed code (retry): %s", step_number, revealed)
                     ok, submit_is_trap = fill_and_submit(page, revealed, step_number, submit_is_trap)
                     if ok:

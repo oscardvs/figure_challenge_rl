@@ -380,7 +380,7 @@ def extract_hidden_codes(html: str) -> list[str]:
                 except Exception:
                     pass
 
-    codes = {c for c in codes if c not in FALSE_POSITIVES}
+    codes = {c for c in codes if not is_false_positive(c)}
     codes = {c for c in codes if not re.match(r"^\d+(?:PX|VH|VW|EM|REM|CH|EX|PC|PT|MM|CM|IN|MS|FR)$", c)}
     codes = {c for c in codes if not c.isdigit()}
 
@@ -494,8 +494,7 @@ def deep_code_extraction(page, known_codes: set[str] | None = None) -> list[str]
     all_codes.update(iframe_codes or [])
 
     # Filter
-    all_codes -= FALSE_POSITIVES
-    all_codes -= _LATIN_FP
+    all_codes = {c for c in all_codes if not is_false_positive(c)}
     all_codes -= known
     all_codes = {c for c in all_codes if not c.isdigit()}
     all_codes = {c for c in all_codes if not re.match(r"^\d+(?:PX|VH|VW|EM|REM|MS|FR)$", c)}
@@ -804,7 +803,7 @@ def force_reset_puzzle(page, failed_codes: list[str]) -> str | None:
     return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
 })()"""))
         new_codes = codes_after - codes_before
-        fresh = [c for c in new_codes if c not in FALSE_POSITIVES]
+        fresh = [c for c in new_codes if not is_false_positive(c)]
         if fresh:
             sorted_fresh = sort_codes_by_priority(fresh)
             logger.info("Force-reset puzzle: fresh code: %s (all: %s)", sorted_fresh[0], sorted_fresh)
@@ -968,7 +967,7 @@ class ChallengeHandlers:
     return [...new Set((text.match(/\\b[A-Z0-9]{6}\\b/g) || []))];
 })()"""))
             new_codes = codes_after - codes_before
-            new_codes = {c for c in new_codes if c not in FALSE_POSITIVES and c not in known_bad}
+            new_codes = {c for c in new_codes if not is_false_positive(c) and c not in known_bad}
             if solve_try == 0:
                 logger.info("Math: codes_after: %s, new_codes: %s",
                             sorted(codes_after)[:5], sorted(new_codes)[:5])
@@ -1003,9 +1002,9 @@ class ChallengeHandlers:
                      revealed_codes, generic_codes, sorted(known_bad)[:5])
         # Revealed codes: the page explicitly says "Code revealed: XXX" — trust it.
         # Filter by stale codes (wrong step) but NOT by failed-this-step (trap button).
-        fresh_revealed = [c for c in revealed_codes if c not in stale_set and c not in FALSE_POSITIVES]
+        fresh_revealed = [c for c in revealed_codes if c not in stale_set and not is_false_positive(c)]
         # Generic codes: filter by both known_bad and FALSE_POSITIVES
-        fresh_generic = [c for c in generic_codes if c not in known_bad and c not in FALSE_POSITIVES]
+        fresh_generic = [c for c in generic_codes if c not in known_bad and not is_false_positive(c)]
         fresh = list(dict.fromkeys(fresh_revealed + fresh_generic))
         if fresh:
             return HandlerResult(codes_found=sort_codes_by_priority(fresh), actions_log=["math pattern"], needs_extraction=True)
@@ -1066,7 +1065,7 @@ class ChallengeHandlers:
                 break
             if result.get("done") and result.get("code"):
                 c = result["code"]
-                if c not in FALSE_POSITIVES:
+                if not is_false_positive(c):
                     codes.append(c)
                     return HandlerResult(codes_found=codes, actions_log=log + ["shadow code found"], success=True)
             if result.get("clicked"):
@@ -1076,7 +1075,7 @@ class ChallengeHandlers:
                 break
 
         final = page.evaluate("(() => { const m = (document.body.textContent||'').match(/(?:code|Code)[^:]*:\\s*([A-Z0-9]{6})/); return m ? m[1] : null; })()")
-        if final and final not in FALSE_POSITIVES:
+        if final and not is_false_positive(final):
             codes.append(final)
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
 
@@ -1527,7 +1526,7 @@ class ChallengeHandlers:
     }
     return null;
 })()""")
-            if code and code not in FALSE_POSITIVES:
+            if code and not is_false_positive(code):
                 codes.append(code)
                 return HandlerResult(codes_found=codes, actions_log=log, success=True)
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
@@ -1577,7 +1576,7 @@ class ChallengeHandlers:
     const m2 = text.match(/(?:retrieved|cache)[^.]*?\\b([A-Z0-9]{6})\\b/i); if (m2) return m2[1].toUpperCase();
     return null;
 })()""")
-        if code and code not in FALSE_POSITIVES:
+        if code and not is_false_positive(code):
             codes.append(code)
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
 
@@ -1691,7 +1690,7 @@ class ChallengeHandlers:
                 break
             if result.get("done") and result.get("code"):
                 c = result["code"]
-                if c not in FALSE_POSITIVES:
+                if not is_false_positive(c):
                     codes.append(c)
                     return HandlerResult(codes_found=codes, actions_log=log, success=True)
 
@@ -1748,7 +1747,7 @@ class ChallengeHandlers:
             # PRIORITY 2: Click Enter Level buttons using JS click
             # (regular <button> elements where JS .click() works fine)
             enter_btns = result.get("enterBtns", [])
-            if current < total and enter_btns:
+            if not at_deepest and enter_btns:
                 target_level = current + 1
                 enter_btns.sort(key=lambda b: abs(b["level"] - target_level))
                 target = enter_btns[0]
@@ -1835,7 +1834,7 @@ class ChallengeHandlers:
     });
     return info;
 })()""")
-                logger.info("Iframe DOM at deepest level: %s", dom_info)
+                logger.debug("Iframe DOM at deepest level: %s", dom_info)
 
             if at_deepest and (result.get("extractBtn") or extract_attempts > 0):
                 extract_attempts += 1
@@ -1911,7 +1910,7 @@ class ChallengeHandlers:
     }
     return null;
 })()""")
-                        if found_code and found_code not in FALSE_POSITIVES:
+                        if found_code and not is_false_positive(found_code):
                             logger.info("Iframe: animated button revealed code: %s", found_code)
                             codes.append(found_code)
                             return HandlerResult(codes_found=codes, actions_log=log, success=True)
@@ -2152,29 +2151,32 @@ class ChallengeHandlers:
     info.allCodes = allCodes.filter(c => !fp.has(c) && !c.endsWith('WRONG')).slice(0, 10);
     return info;
 })()""")
-                    logger.info("Iframe: post-click analysis (attempt %d): %s", extract_attempts, post_click)
+                    logger.debug("Iframe: post-click analysis (attempt %d): %s", extract_attempts, post_click)
                 time.sleep(0.5)
                 continue
             logger.info("Iframe: nothing to click (round %d, %d/%d)", click_round, current, total)
             break
 
-        final = page.evaluate("""\
+        # Final extraction: try high-confidence patterns, then all candidates
+        # (Python-side is_false_positive filters noise)
+        final_candidates = page.evaluate("""\
 (() => {
     const text = document.body.textContent || '';
-    const m = text.match(/(?:code|Code|extracted)[^:]*?:\\s*([A-Z0-9]{6})/); if (m) return m[1];
+    const results = [];
+    const m = text.match(/(?:code|Code|extracted)[^:]*?:\\s*([A-Z0-9]{6})/);
+    if (m) results.push(m[1]);
     for (const el of document.querySelectorAll('[class*="dashed"], [class*="green"], [class*="emerald"]')) {
         const t = (el.textContent || '').trim();
-        const cm = t.match(/\\b([A-Z0-9]{6})\\b/); if (cm && t.length < 200) return cm[1];
+        const cm = t.match(/\\b([A-Z0-9]{6})\\b/); if (cm && t.length < 200) results.push(cm[1]);
     }
-    // Also check hidden elements (textContent includes hidden text)
-    const allText = document.body.textContent || '';
-    const allCodes = allText.match(/\\b[A-Z0-9]{6}\\b/g) || [];
-    const fp = ['IFRAME','BWRONG','1WRONG','CWRONG','STEPGO'];
-    for (const c of allCodes) { if (!fp.includes(c)) return c; }
-    return null;
-})()""")
-        if final and final not in FALSE_POSITIVES:
-            codes.append(final)
+    const allCodes = text.match(/\\b[A-Z0-9]{6}\\b/g) || [];
+    for (const c of allCodes) { if (!results.includes(c) && !c.endsWith('WRONG')) results.push(c); }
+    return [...new Set(results)];
+})()""") or []
+        for fc in final_candidates:
+            if not is_false_positive(fc):
+                codes.append(fc)
+                break  # Take the first non-FP code
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
 
     def handle_mutation(self, page) -> HandlerResult:
@@ -2207,7 +2209,7 @@ class ChallengeHandlers:
                 break
             if result.get("done") and result.get("code"):
                 c = result["code"]
-                if c not in FALSE_POSITIVES:
+                if not is_false_positive(c):
                     codes.append(c)
                     return HandlerResult(codes_found=codes, actions_log=log, success=True)
             current = result.get("current", 0)
@@ -2242,7 +2244,7 @@ class ChallengeHandlers:
     }
     return null;
 })()""")
-        if final and final not in FALSE_POSITIVES:
+        if final and not is_false_positive(final):
             codes.append(final)
         return HandlerResult(codes_found=codes, actions_log=log, needs_extraction=True)
 
@@ -2296,7 +2298,7 @@ class ChallengeHandlers:
             prev_scroll_y = cur_y
 
         # Try accumulated codes from Phase 0
-        p0_new = [c for c in phase0_codes if c not in FALSE_POSITIVES
+        p0_new = [c for c in phase0_codes if not is_false_positive(c)
                   and c not in _LATIN_FP and not c.isdigit()
                   and c not in (known_codes or [])
                   and not re.match(r'^\d+(?:PX|VH|VW|EM|REM|MS|FR)$', c)]
@@ -2671,7 +2673,7 @@ class ChallengeHandlers:
 })()""")
             if result and result.get("code"):
                 c = result["code"]
-                if c not in FALSE_POSITIVES:
+                if not is_false_positive(c):
                     codes.append(c)
                     return HandlerResult(codes_found=codes, actions_log=["delayed: code found"])
             if result and result.get("done"):
@@ -2689,7 +2691,7 @@ class ChallengeHandlers:
     const known = new Set(['FILLER', 'SUBMIT', 'BUTTON', 'SCROLL', 'REVEAL']);
     return matches.find(m => !known.has(m) && /[0-9]/.test(m)) || null;
 })()""")
-        if final and final not in FALSE_POSITIVES:
+        if final and not is_false_positive(final):
             codes.append(final)
         return HandlerResult(codes_found=codes, actions_log=["delayed: waited"], needs_extraction=True)
 
